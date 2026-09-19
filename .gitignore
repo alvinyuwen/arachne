@@ -6,3 +6,7 @@ public/runs/
 ngrok.zip
 ngrok.exe
 *.log
+
+# watch database (phone numbers + URLs, as sensitive as .env)
+watches.db
+watches.db-*
