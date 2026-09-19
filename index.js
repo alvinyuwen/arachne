@@ -4,6 +4,7 @@
  * Flow: Linq webhook -> ack over iMessage -> Stagehand drives a remote
  * Browserbase browser -> screenshot + summary sent back over iMessage.
  */
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +26,7 @@ const {
   LINQ_API_KEY,
   LINQ_PHONE_NUMBER,
   LINQ_API_URL = "https://api.linqapp.com/api/partner/v3/messages",
+  LINQ_WEBHOOK_SECRET,
   BROWSERBASE_API_KEY,
   BROWSERBASE_PROJECT_ID,
   PUBLIC_BASE_URL,
@@ -34,6 +36,56 @@ const {
 
 const TASK_TIMEOUT = Number(TASK_TIMEOUT_MS);
 const MAX_STEPS = 6;
+
+/* ------------------------------------------------------------------ */
+/* Webhook signature verification (Standard Webhooks)                  */
+/* ------------------------------------------------------------------ */
+
+// Replay window mandated by the spec.
+const SIGNATURE_TOLERANCE_SECONDS = 300;
+
+/**
+ * Linq signs webhooks per the Standard Webhooks spec: HMAC-SHA256 over
+ * "{webhook-id}.{webhook-timestamp}.{raw body}", keyed by the base64-decoded
+ * secret, sent as "v1,<base64>" (possibly several, space separated).
+ *
+ * The endpoint is publicly reachable, so without this anyone who learns the
+ * URL could make the agent burn Browserbase sessions and text strangers.
+ */
+function verifyWebhookSignature(req) {
+  if (!LINQ_WEBHOOK_SECRET) return { ok: true, skipped: true };
+
+  const id = req.get("webhook-id");
+  const timestamp = req.get("webhook-timestamp");
+  const header = req.get("webhook-signature");
+  if (!id || !timestamp || !header) {
+    return { ok: false, reason: "missing webhook-id/timestamp/signature header" };
+  }
+
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > SIGNATURE_TOLERANCE_SECONDS) {
+    return { ok: false, reason: `timestamp outside ${SIGNATURE_TOLERANCE_SECONDS}s tolerance` };
+  }
+
+  const key = Buffer.from(LINQ_WEBHOOK_SECRET.replace(/^whsec_/, ""), "base64");
+  const hmac = crypto.createHmac("sha256", key);
+  // Feed the raw bytes, not a re-serialized object: any key reordering or
+  // whitespace change from JSON.parse -> JSON.stringify breaks the digest.
+  hmac.update(`${id}.${timestamp}.`);
+  hmac.update(req.rawBody ?? Buffer.alloc(0));
+  const expected = hmac.digest();
+
+  const provided = header
+    .split(" ")
+    .map((entry) => entry.split(","))
+    .filter(([version, value]) => version === "v1" && value)
+    .map(([, value]) => Buffer.from(value, "base64"));
+
+  const matched = provided.some(
+    (sig) => sig.length === expected.length && crypto.timingSafeEqual(sig, expected),
+  );
+  return matched ? { ok: true } : { ok: false, reason: "signature mismatch" };
+}
 
 /* ------------------------------------------------------------------ */
 /* Linq outbound                                                       */
@@ -344,7 +396,15 @@ async function handleRequest(senderNumber, messageText) {
 /* ------------------------------------------------------------------ */
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+// Keep the raw bytes around; signature verification needs them verbatim.
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(PUBLIC_DIR, { maxAge: 0, etag: false }));
 
@@ -358,10 +418,17 @@ app.get("/health", async (_req, res) =>
     agentNumber: LINQ_PHONE_NUMBER ?? null,
     publicBaseUrl: (await resolvePublicBaseUrl()) ?? null,
     browserbaseProjectId: Boolean(BROWSERBASE_PROJECT_ID),
+    signatureVerification: Boolean(LINQ_WEBHOOK_SECRET),
   }),
 );
 
 app.post("/webhook/linq", (req, res) => {
+  const signature = verifyWebhookSignature(req);
+  if (!signature.ok) {
+    console.warn(`[webhook] REJECTED: ${signature.reason}`);
+    return res.status(401).json({ error: "invalid signature" });
+  }
+
   const { senderNumber, messageText, direction } = parseWebhook(req.body);
   console.log(`[webhook] from=${senderNumber} text=${JSON.stringify(messageText)}`);
 
@@ -395,4 +462,9 @@ app.listen(PORT, () => {
   })) {
     if (!value) console.warn(`  WARNING: ${name} is not set in .env`);
   }
+  console.log(
+    LINQ_WEBHOOK_SECRET
+      ? "  signature verification ENABLED"
+      : "  WARNING: LINQ_WEBHOOK_SECRET unset - webhook accepts unsigned requests",
+  );
 });
