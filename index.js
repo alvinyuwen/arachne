@@ -23,6 +23,7 @@ import express from "express";
 // working; if a future npm update breaks it, build schemas from stagehand's zod.
 import { z } from "zod";
 import { Stagehand, browserbase } from "@browserbasehq/stagehand";
+import Browserbase from "@browserbasehq/sdk";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -60,6 +61,9 @@ const {
   // Every ack is a billable outbound message. "slow" sends one only where the
   // wait warrants it; "never" collapses every exchange to a single send.
   ACK_MODE = "slow",
+  // Residential proxies for browser sessions. Costs proxy bandwidth, but
+  // without it many public pages serve a login wall to a datacenter IP.
+  BROWSER_PROXIES = "true",
   DEBUG_TOKEN,
 } = process.env;
 
@@ -560,7 +564,7 @@ const MEMORY_TTL = Number(MEMORY_TTL_MS);
 const CLARIFY_TTL = Number(CLARIFY_TTL_MS);
 
 function emptyConversation() {
-  return { turns: [], lastTask: null, pendingClarify: null, updatedAt: Date.now() };
+  return { turns: [], lastTask: null, pendingClarify: null, pendingLogin: null, updatedAt: Date.now() };
 }
 
 function getConversation(sender) {
@@ -926,6 +930,12 @@ const ClassificationSchema = z.object({
   restatedGoal: z.string().describe("One sentence restating what the user wants"),
   subject: z.string().describe('Two to four words naming the thing itself, e.g. "power banks" or "Louvre opening hours". No verbs.'),
   searchQueries: z.array(z.string()).describe("2-4 web search queries. Never empty."),
+  directUrls: z
+    .array(z.string())
+    .describe(
+      "Absolute URLs to read directly when the request names a specific page or " +
+        "profile, e.g. an Instagram handle's profile URL. Empty array otherwise.",
+    ),
   targetUrl: z.string().nullable().describe("Absolute URL including scheme for the browser tier, otherwise null"),
   constraints: z.object({
     region: z.string().nullable().describe("Country or region the user mentioned, else null"),
@@ -967,6 +977,13 @@ about "reviews" cannot be answered from storefronts alone:
 For social_media, target PUBLIC pages only - public profile pages, about/press pages, news
 coverage. Never target a login or account page.
 
+DIRECT URLS
+When the request names a specific account, profile or page, put its canonical public URL in
+directUrls so it gets read directly rather than only searched for. A handle like @someone on
+Instagram becomes https://www.instagram.com/someone/. This matters for people and small
+accounts, which search engines do not cover but whose own profile page states the facts
+plainly. Leave it empty when no specific page is named.
+
 HARD RULES
 - searchQueries must never be empty.
 - targetUrl must be an absolute URL starting with http:// or https://, or null.
@@ -989,6 +1006,7 @@ subject: "power banks"
 searchQueries: ["best power bank 2026 review", "power bank comparison tested capacity",
                 "power bank reddit recommendations", "buy power bank Canada shipping"]
 targetUrl: null
+directUrls: []
 constraints: { region: "Canada", budget: null, mustInclude: ["links", "reviews", "price", "functionality", "shipping"] }
 resultCount: 3`;
 
@@ -1012,6 +1030,9 @@ LATEST REQUEST: ${messageText}`
   if (!c.searchQueries.length) c.searchQueries = [messageText];
   c.searchQueries = c.searchQueries.slice(0, 4);
   if (!/^https?:\/\//i.test(c.targetUrl ?? "")) c.targetUrl = null;
+  c.directUrls = (c.directUrls ?? [])
+    .filter((u) => /^https?:\/\//i.test(u))
+    .slice(0, 3);
   if (c.tier === "browser" && !c.targetUrl) c.tier = "research";
   c.resultCount = Math.min(Math.max(c.resultCount || 3, 1), 5);
   return c;
@@ -1099,6 +1120,7 @@ rather than three variations of the same recommendation.
 ${c.constraints.region ? `The user is in ${c.constraints.region}: prefer options actually available there. regionNote is ONE short sentence on availability or shipping - say plainly if the sources do not confirm it.` : ""}
 ${SOURCE_RULES}`,
     browserObjective: (c) => `Find and compare products for: ${c.restatedGoal}`,
+    extractHint: "",
     render: (data, c, corpus) => {
       const region = c.constraints.region ? ` in ${c.constraints.region}` : "";
       const subject = stripMarkdown(c.subject || "options").toLowerCase();
@@ -1130,6 +1152,7 @@ ${SOURCE_RULES}`,
     synthesisSystem: () =>
       `You answer a question from the numbered sources. Be direct and specific.\n${SOURCE_RULES}`,
     browserObjective: (c) => `Find the answer to: ${c.restatedGoal}`,
+    extractHint: "",
     render: (data, c, corpus) => {
       const lines = [stripMarkdown(data.answer), ""];
       for (const f of data.keyFacts.slice(0, 4)) {
@@ -1148,6 +1171,9 @@ ${SOURCE_RULES}`,
     schema: SocialSchema,
     synthesisSystem: () => `You report on public social media presence.\n${AUTH_POLICY}\n${SOURCE_RULES}`,
     browserObjective: (c) => `Find publicly visible information about: ${c.restatedGoal}`,
+    extractHint:
+      "If this page is a sign-in or account-required screen rather than the content " +
+      "asked for, set accessBlocked true and say what was unavailable in blockedReason.",
     render: (data, c, corpus) => {
       const lines = [`${clamp(stripMarkdown(data.subject), 60)} — what's public:`, ""];
       // Findings repeat the same handle once per post, which reads as padding.
@@ -1179,6 +1205,10 @@ ${SOURCE_RULES}`,
     schema: InteractiveSchema,
     synthesisSystem: () => `You report the outcome of operating a web page.\n${SOURCE_RULES}`,
     browserObjective: (c) => c.restatedGoal,
+    extractHint:
+      "If this page is a sign-in or account-required screen rather than the content " +
+      "asked for, set blocked true and say what was unavailable in blockedReason. " +
+      "Do not write field names into any prose field.",
     render: (data) => {
       const lines = [stripMarkdown(data.outcome)];
       if (data.stepsTaken?.length) {
@@ -1321,8 +1351,14 @@ async function buildCorpus(results, deadline, minSources = 2) {
     const content = typeof res.content === "string" ? res.content : JSON.stringify(res.content);
     const text = stripBoilerplate(content);
 
-    // Bot blocks return HTTP 200 with a CAPTCHA body, so status is not enough.
-    if (text.length < 800) throw new Error(`thin body (${text.length} chars)`);
+    // Bot blocks return HTTP 200 with a CAPTCHA body, so status is not enough
+    // to tell a block from a page. Length is a decent proxy for that among
+    // search results, and a bad one for a page the request named outright: a
+    // profile page is legitimately short, and this floor threw away an
+    // Instagram profile carrying the exact follower count that was asked for,
+    // by 49 characters. Named pages only have to clear the block check.
+    const floor = r.direct ? 120 : 800;
+    if (text.length < floor) throw new Error(`thin body (${text.length} chars)`);
     const block = blockFromText({ url: r.url, body: text });
     if (block.blocked) throw new Error(`blocked: ${block.kind}`);
 
@@ -1452,9 +1488,20 @@ async function enrichPicksWithRetail(picks, classification, deadline) {
 async function runResearchTier(classification, deadline, { minSources = 2 } = {}) {
   deadline.assert("research");
   const results = await searchAll(classification.searchQueries, deadline);
-  if (!results.length) throw new ResearchThinError("search returned nothing");
 
-  const corpus = await buildCorpus(results, deadline, minSources);
+  // Pages the request named outright go first, and are not subject to search
+  // finding them. A search engine has nothing to say about a small personal
+  // account, while that account's own page states the follower count plainly.
+  const direct = (classification.directUrls ?? []).map((url) => {
+    let host = url;
+    try { host = new URL(url).hostname.replace(/^www\./, ""); } catch { /* keep raw */ }
+    return { title: host, url, host, direct: true };
+  });
+  const seen = new Set(direct.map((d) => d.url));
+  const merged = [...direct, ...results.filter((r) => !seen.has(r.url))];
+  if (!merged.length) throw new ResearchThinError("search returned nothing");
+
+  const corpus = await buildCorpus(merged, deadline, minSources);
   const playbook = PLAYBOOKS[classification.taskType];
 
   const rendered = corpus
@@ -1557,6 +1604,138 @@ function validateSourceIndexes(data, corpus, classification) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Authenticated browsing                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Signing in without the agent ever holding a credential.
+ *
+ * The password problem is not storage, it is transmission: anything texted
+ * here has already passed through Apple and Linq before this process sees it,
+ * so encrypting a local copy would secure one link in a chain that already
+ * leaked. And it would buy nothing, because the browser tier structurally
+ * cannot use a password - detectBlock stops before a gated page and the decide
+ * loop has no field that can hold one.
+ *
+ * So the credential never travels. Browserbase keeps a persistent context (a
+ * cookie jar) per sender, and a session bound to that context exposes a live
+ * view URL. The user opens that link, types the password into the real site in
+ * that browser, and the cookies land in the context. This process only ever
+ * holds a context id, which is an opaque handle. A session cookie can also be
+ * revoked, where a reused password cannot.
+ *
+ * The live view URL is a bearer handle to a running browser, so it is sent
+ * only to the verified sender, only on explicit request, and the session is
+ * released as soon as the login is confirmed.
+ */
+const senderContexts = new Map();
+
+/**
+ * Whether this account can attach residential proxies to a browser session.
+ *
+ * The fetch API accepts them on every plan; sessions are a higher tier and
+ * fail outright with "Failed to create a Browserbase session". Rather than
+ * making that a setting somebody has to get right, the first attempt answers
+ * it and the process remembers.
+ */
+let proxySessions = BROWSER_PROXIES !== "false";
+
+async function launchSession(extra = {}) {
+  const base = {
+    apiKey: BROWSERBASE_API_KEY,
+    projectId: BROWSERBASE_PROJECT_ID,
+    ...extra,
+  };
+  if (proxySessions) {
+    try {
+      return await browserbase.launch({ ...base, proxies: true });
+    } catch (err) {
+      proxySessions = false;
+      console.warn(
+        `[browser] session proxies unavailable on this plan (${clamp(err.message, 60)}); ` +
+          "continuing without them - fetch still uses them",
+      );
+    }
+  }
+  return browserbase.launch(base);
+}
+
+const bb = new Browserbase({ apiKey: BROWSERBASE_API_KEY });
+
+async function ensureContext(sender) {
+  const existing = senderContexts.get(sender);
+  if (existing) return existing;
+  const created = await bb.contexts.create({ projectId: BROWSERBASE_PROJECT_ID });
+  senderContexts.set(sender, created.id);
+  console.log(`[login] created context for ${sender}`);
+  return created.id;
+}
+
+/**
+ * Open a browser the user can drive, parked on the page that asked them to
+ * sign in. keepAlive holds it open while they do; without it the session ends
+ * the moment this function returns and there is nothing to log in to.
+ */
+async function startLoginSession(sender, url) {
+  const contextId = await ensureContext(sender);
+
+  // Created through Stagehand's launcher rather than the raw SDK, because a
+  // session made without its extension cannot then be driven by it - which is
+  // what left the live view sitting on a blank page instead of the sign-in
+  // form the user was sent there to fill in.
+  const browser = await launchSession({
+    keepAlive: true,
+    browserSettings: { context: { id: contextId, persist: true } },
+  });
+
+  try {
+    // browser.context only becomes usable once Stagehand is attached; the
+    // handle alone cannot open a page.
+    await Stagehand.create({
+      browser,
+      model: { modelName: OPENAI_MODEL, apiKey: OPENAI_API_KEY },
+    });
+    const page = await browser.context.newPage(url);
+    await page.waitForLoadState("load").catch(() => {});
+    console.log(`[login] session parked on ${url}`);
+  } catch (err) {
+    // Not fatal: the live view still opens, the user just has to navigate.
+    console.warn(`[login] could not park the session on ${url}: ${err.message}`);
+  }
+  // Deliberately not closing the handle: closing it ends the session, and the
+  // whole point is that it outlives this turn while the user signs in.
+
+  const session = { id: browser.sessionId };
+  const live = await bb.sessions.debug(session.id);
+  return {
+    contextId,
+    sessionId: session.id,
+    liveUrl: live.debuggerFullscreenUrl || live.debuggerUrl,
+  };
+}
+
+/**
+ * End the session so the context is written back.
+ *
+ * persist saves cookies when the session completes, so releasing it is what
+ * actually banks the login - leaving it running would keep the cookies stranded
+ * in a session nobody is using.
+ */
+async function finishLoginSession(sessionId) {
+  try {
+    await bb.sessions.update(sessionId, {
+      projectId: BROWSERBASE_PROJECT_ID,
+      status: "REQUEST_RELEASE",
+    });
+  } catch (err) {
+    console.warn(`[login] release failed (${err.message}); context may still persist`);
+  }
+}
+
+const LOGIN_CONFIRM_RE = /\b(done|finished|ok(ay)?|logged? ?in|signed? ?in|ready|yes|yep|complete)\b/i;
+const LOGIN_REQUEST_RE = /\b(log ?in|login|sign ?in|authenticate|connect (my )?account)\b/i;
+
+/* ------------------------------------------------------------------ */
 /* Browser tier                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1568,7 +1747,7 @@ const DecisionSchema = z.object({
   stopReason: z.string().nullable(),
 });
 
-async function withSession(fn) {
+async function withSession(fn, { contextId = null } = {}) {
   return browserSlot(async () => {
     if (!BROWSERBASE_PROJECT_ID) {
       throw new Error("BROWSERBASE_PROJECT_ID is not set in .env");
@@ -1576,10 +1755,15 @@ async function withSession(fn) {
     let browser;
     let stagehand;
     try {
-      browser = await browserbase.launch({
-        apiKey: BROWSERBASE_API_KEY,
-        projectId: BROWSERBASE_PROJECT_ID,
-      });
+      // Sites decide what to serve by who is asking, not only what is asked
+      // for: Instagram serves a public profile to a phone and redirects a bare
+      // datacenter IP to /accounts/login/. Proxies are attempted for that
+      // reason and dropped silently if the plan does not allow them.
+      browser = await launchSession(
+        // A context the user has already signed in through, when there is one.
+        // persist keeps it current if this session picks up new cookies.
+        contextId ? { browserSettings: { context: { id: contextId, persist: true } } } : {},
+      );
       console.log(`[browser] session ${browser.sessionId}`);
       stagehand = await Stagehand.create({
         browser,
@@ -1612,7 +1796,7 @@ async function captureScreenshot(url, runId, n = 0) {
   });
 }
 
-async function runBrowserTier(classification, deadline, runId) {
+async function runBrowserTier(classification, deadline, runId, { contextId = null } = {}) {
   const playbook = PLAYBOOKS[classification.taskType];
   const objective = playbook.browserObjective(classification);
 
@@ -1648,7 +1832,11 @@ async function runBrowserTier(classification, deadline, runId) {
         .observe(objective, {
           page,
           timeout: 20000,
-          ignoreLocators: [{ selector: "nav" }, { selector: "footer" }],
+          // Locator instances, not { selector } literals: the plain objects
+          // were rejected by the schema, which took observe's whole call with
+          // them - and its catch quietly returned no candidates, so the decide
+          // loop has been choosing from an empty list.
+          ignoreLocators: [page.locator("nav"), page.locator("footer")],
         })
         .catch((err) => {
           console.warn(`[observe] failed: ${err.message}`);
@@ -1729,7 +1917,7 @@ ${history.length ? history.map((h, i) => `${i + 1}. ${h.description} -> ${h.outc
 
     const data = await extractWithFallback(stagehand, page, playbook, classification, history);
     return { data, tier: "browser", screenshots, history, corpus: null };
-  });
+  }, { contextId });
 }
 
 async function screenshotInto(page, runId, n) {
@@ -1747,13 +1935,28 @@ async function screenshotInto(page, runId, n) {
 
 /** An over-strict schema can throw away a good extraction - degrade, don't fail. */
 async function extractWithFallback(stagehand, page, playbook, classification, history) {
-  const instruction = `${classification.restatedGoal}. Use only what is visible on this page. For any link, use an href that actually appears on the page.`;
+  // The schema has carried a blocked flag all along and nothing ever told the
+  // model when to raise it, so a page that was plainly a sign-in screen came
+  // back as blocked:false. A regex cannot fill that gap - x.com serves its
+  // landing page rather than redirecting, while a public Instagram profile
+  // carries "Log In" in its chrome - but the extraction is looking at the
+  // page, so ask it directly.
+  const instruction =
+    `${classification.restatedGoal}. Use only what is visible on this page. ` +
+    "For any link, use an href that actually appears on the page. " +
+    // The hint names the field this playbook's schema actually has. Naming
+    // both put the field names into the prose instead of setting either.
+    (playbook.extractHint ?? "");
   try {
     const r = await stagehand.extract(instruction, playbook.schema, {
       page,
       timeout: 45000,
       screenshot: true,
-      ignoreLocators: [{ selector: "nav" }, { selector: ".cookie-banner" }],
+      // Same here: this argument failed validation on every call, so the
+      // schema-shaped extraction never ran and every browser task fell back to
+      // a plain summary - which is why structured fields like blocked were
+      // never populated.
+      ignoreLocators: [page.locator("nav"), page.locator(".cookie-banner")],
     });
     return r.data;
   } catch (err) {
@@ -1794,7 +1997,7 @@ function shapeFallback(taskType, summary, finalUrl, history = []) {
  * Degradation ladder. The invariant is that the user always gets links:
  * browser -> research -> raw search results.
  */
-async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT), { conversation = null, onClassified = null } = {}) {
+async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT), { conversation = null, onClassified = null, contextId = null } = {}) {
   const notes = [];
 
   let classification;
@@ -1810,6 +2013,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
       // absence here was latent until something downstream needed it.
       subject: clamp(messageText, 40),
       searchQueries: [messageText],
+      directUrls: [],
       targetUrl: null,
       constraints: { region: null, budget: null, mustInclude: [] },
       resultCount: 3,
@@ -1823,7 +2027,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
   let result;
   if (classification.tier === "browser") {
     try {
-      result = await runBrowserTier(classification, deadline, runId);
+      result = await runBrowserTier(classification, deadline, runId, { contextId });
       if (result.authWall) {
         // Policy: fall back to public sources rather than attempting a login.
         const blockedHost = hostOf(classification.targetUrl ?? result.authWall.url);
@@ -1831,7 +2035,9 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
         notes.push(`${blockedHost} needs a login, so I didn't go further.`);
         classification = forPublicFallback(classification, blockedHost);
         const research = await runResearchTier(classification, deadline, { minSources: 1 });
-        result = { ...research, screenshots: result.screenshots };
+        // Remember which host blocked us, so the reply can offer to sign in
+        // rather than just reporting a thinner answer.
+        result = { ...research, screenshots: result.screenshots, blockedHost };
       }
     } catch (err) {
       console.warn(`[browser] tier failed (${err.message}), falling back to research`);
@@ -1844,11 +2050,25 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
     } catch (err) {
       if (classification.targetUrl && deadline.remaining() > 60000) {
         console.warn(`[research] thin (${err.message}), escalating to browser`);
-        result = await runBrowserTier(classification, deadline, runId);
+        result = await runBrowserTier(classification, deadline, runId, { contextId });
       } else {
         throw err;
       }
     }
+  }
+
+  // detectBlock catches a redirect to a sign-in URL, which is the common
+  // shape, but not a site that serves its landing page with a sign-in panel
+  // and no content - x.com does exactly that. Broadening the regexes is the
+  // wrong fix, because a public Instagram profile also carries "Log In" links
+  // in its chrome. The extraction saw the actual page, so take its word for it.
+  if (
+    !result.blockedHost &&
+    (result.data?.blocked || result.data?.accessBlocked) &&
+    classification.targetUrl
+  ) {
+    result.blockedHost = hostOf(classification.targetUrl);
+    console.log(`[auth] extraction reports ${result.blockedHost} needs a login`);
   }
 
   const playbook = PLAYBOOKS[classification.taskType];
@@ -1871,6 +2091,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
 
   return {
     text,
+    blockedHost: result.blockedHost ?? null,
     screenshots: screenshots.slice(0, 1),
     tier: result.tier,
     taskType: classification.taskType,
@@ -1926,14 +2147,14 @@ async function fallbackLinks(messageText) {
   }
 }
 
-async function handleRequest(senderNumber, messageText, { conversation = null, send = sendLinq, onClassified = null } = {}) {
+async function handleRequest(senderNumber, messageText, { conversation = null, send = sendLinq, onClassified = null, contextId = null } = {}) {
   const runId = crypto.randomUUID();
   const deadline = new Deadline(TASK_TIMEOUT);
   const started = Date.now();
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
 
   try {
-    const result = await runTask(messageText, runId, deadline, { conversation, onClassified });
+    const result = await runTask(messageText, runId, deadline, { conversation, onClassified, contextId });
 
     const parts = [{ type: "text", value: result.text }];
     if (result.screenshots.length) {
@@ -1996,6 +2217,62 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
   }
 
   const mem = recordTurn(senderNumber, "user", safeText, "user");
+
+  // A login handoff in progress takes precedence over routing. These are
+  // deterministic checks rather than another model call: "done" after being
+  // sent a sign-in link is not an ambiguous sentence, and a model that
+  // mis-routes it would strand the user mid-flow.
+  const login = mem.pendingLogin && Date.now() - mem.pendingLogin.at < 1800000
+    ? mem.pendingLogin
+    : null;
+
+  if (login?.stage === "offered" && LOGIN_REQUEST_RE.test(safeText)) {
+    let handoff;
+    try {
+      handoff = await startLoginSession(senderNumber, login.url);
+    } catch (err) {
+      console.warn(`[login] could not start a session: ${err.message}`);
+      mem.pendingLogin = null;
+      const note = `I couldn't open a sign-in browser just now (${clamp(err.message, 60)}). Try again in a moment.`;
+      recordTurn(senderNumber, "assistant", note, "error");
+      await send(senderNumber, [{ type: "text", value: note }]);
+      return;
+    }
+    mem.pendingLogin = { ...login, ...handoff, stage: "waiting", at: Date.now() };
+    const note =
+      `Open this and sign in to ${login.host} yourself - it's a browser running on my side, ` +
+      `so your password goes straight to ${login.host} and never through me:
+
+${handoff.liveUrl}
+
+` +
+      `Text me "done" when you're in and I'll pick the task back up. ` +
+      `Don't share that link - anyone with it can drive that browser.`;
+    // The live view URL is deliberately not stored in history: it is a bearer
+    // handle to a running browser, and history goes into later prompts.
+    recordTurn(senderNumber, "assistant", `(sent a sign-in link for ${login.host})`, "task");
+    await send(senderNumber, [{ type: "text", value: note }]);
+    return;
+  }
+
+  if (login?.stage === "waiting" && LOGIN_CONFIRM_RE.test(safeText)) {
+    await finishLoginSession(login.sessionId);
+    mem.pendingLogin = null;
+    console.log(`[login] resuming "${clamp(login.request, 60)}" with a signed-in context`);
+    if (shouldAck("product_research", "browser")) {
+      await send(senderNumber, [{ type: "text", value: "Thanks - picking that back up now." }]);
+    }
+    const resumed = await handleRequest(senderNumber, login.request, {
+      conversation: mem,
+      send,
+      contextId: login.contextId,
+    });
+    if (resumed) {
+      recordTaskResult(senderNumber, resumed);
+      recordTurn(senderNumber, "assistant", resumed.text, "task");
+    }
+    return;
+  }
 
   let route;
   try {
@@ -2062,20 +2339,54 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
   const request = route.resolvedRequest || safeText;
   if (request !== safeText) console.log(`[route] resolved -> ${clamp(request, 80)}`);
 
-  // The tier is not known until classifyTask runs inside handleRequest, so the
-  // ack decision uses what the router saw. Product research and anything with
-  // a URL to drive are the slow paths.
-  const looksSlow = /\bhttps?:\/\//i.test(request) || route.referencesPriorResult === false;
-  if (shouldAck(looksSlow ? "product_research" : "factual_lookup", "research")) {
-    await send(senderNumber, [{ type: "text", value: "On it - researching this now." }]);
+  // The ack waits for the real classification rather than guessing from the
+  // wording: a moment later the task type and tier are known exactly, and that
+  // is what decides whether the wait is long enough to be worth a billable
+  // message.
+  const onClassified = async (c) => {
+    if (!shouldAck(c.taskType, c.tier)) return;
+    await send(senderNumber, [{
+      type: "text",
+      value: c.tier === "browser"
+        ? "On it - opening that page now."
+        : "On it - researching this now.",
+    }]);
+  };
+
+  const result = await handleRequest(senderNumber, request, {
+    conversation: mem,
+    send,
+    onClassified,
+    // Reuse a context this sender has already signed in through, so a site
+    // they authenticated once does not ask again.
+    contextId: senderContexts.get(senderNumber) ?? null,
+  });
+
+  if (!result) {
+    recordTurn(senderNumber, "assistant", "(that one didn't work out)", "error");
+    return;
   }
 
-  const result = await handleRequest(senderNumber, request, { conversation: mem, send });
-  if (result) {
-    recordTaskResult(senderNumber, result);
-    recordTurn(senderNumber, "assistant", result.text, "task");
-  } else {
-    recordTurn(senderNumber, "assistant", "(that one didn't work out)", "error");
+  recordTaskResult(senderNumber, result);
+  recordTurn(senderNumber, "assistant", result.text, "task");
+
+  // Something turned us away at a login. Offer the handover rather than
+  // starting a browser speculatively: standing one up costs a session, and the
+  // user may be perfectly happy with the public answer they just got.
+  if (result.blockedHost && !senderContexts.has(senderNumber)) {
+    mem.pendingLogin = {
+      stage: "offered",
+      host: result.blockedHost,
+      url: `https://${result.blockedHost}`,
+      request,
+      at: Date.now(),
+    };
+    const offer =
+      `That one's behind a login on ${result.blockedHost}. Reply "login" and I'll send ` +
+      `you a link to sign in yourself - the password goes straight to ${result.blockedHost}, ` +
+      `never through me - and after that I can keep using the session.`;
+    recordTurn(senderNumber, "assistant", offer, "task");
+    await send(senderNumber, [{ type: "text", value: offer }]);
   }
 }
 
@@ -2171,6 +2482,15 @@ app.post("/debug/turn", async (req, res) => {
         turns: mem.turns,
         lastTask: mem.lastTask,
         pendingClarify: mem.pendingClarify,
+        // liveUrl omitted on purpose: it is a bearer handle to a running
+        // browser, and this response is easy to paste somewhere.
+        pendingLogin: mem.pendingLogin && {
+          stage: mem.pendingLogin.stage,
+          host: mem.pendingLogin.host,
+          request: mem.pendingLogin.request,
+          hasLiveUrl: Boolean(mem.pendingLogin.liveUrl),
+          sessionId: mem.pendingLogin.sessionId ?? null,
+        },
       },
     });
   } catch (err) {
