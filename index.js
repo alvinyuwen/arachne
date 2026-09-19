@@ -87,6 +87,10 @@ const {
   // A floor between two alerts for the same watch, so a value flickering
   // across a threshold cannot turn into a stream of texts.
   WATCH_NOTIFY_COOLDOWN_MS = 1800000,
+  // A ceiling on one browser escalation. stagehand.extract has its own timeout
+  // but the session, the page load and the teardown do not, and an unbounded
+  // one can spin.
+  WATCH_BROWSER_TIMEOUT_MS = 90000,
 } = process.env;
 
 const TASK_TIMEOUT = Number(TASK_TIMEOUT_MS);
@@ -1742,14 +1746,14 @@ async function observeViaBrowser(watch, url) {
   });
 }
 
-async function observeUrl(watch, url, deadline) {
+async function observeUrl(watch, url, deadline, { allowBrowser = true } = {}) {
   const build = OBSERVE_SCHEMAS[watch.kind];
   if (!build) throw new Error(`unknown watch kind ${watch.kind}`);
   const schema = build(watch.metric || "value");
 
   // A watch already known to need a browser skips straight to it rather than
   // paying for a fetch that returned nothing last time.
-  if (watch.source?.needsBrowser) return observeViaBrowser(watch, url);
+  if (allowBrowser && watch.source?.needsBrowser) return observeViaBrowser(watch, url);
 
   const raw = await withTimeout(
     browserbase.fetch({
@@ -1775,7 +1779,7 @@ async function observeUrl(watch, url, deadline) {
   // Nothing found is the signature of a client-rendered page: the fetch
   // succeeds and returns an empty document. Escalate once rather than
   // reporting a readable page as unreadable.
-  if (observationIsEmpty(watch, obs)) {
+  if (allowBrowser && observationIsEmpty(watch, obs)) {
     console.log(`[watch] ${hostOf(url)} gave nothing to fetch; trying a browser`);
     try {
       const viaBrowser = await observeViaBrowser(watch, url);
@@ -1806,8 +1810,36 @@ async function observeWatch(watch, deadline) {
   }
   if (!urls.length) throw new Error("watch has no page to check");
 
-  const settled = await mapLimit(urls.slice(0, 4), 2, (u) => observeUrl(watch, u, deadline));
-  const seen = settled.filter((s) => s.ok).map((s) => s.value);
+  // Fetch every candidate first, with escalation switched off. A hunting watch
+  // has up to four URLs, and letting each one decide independently to open a
+  // browser meant four sessions in parallel for one check - which is what
+  // buried the log in 151 CDP errors and took the process down with it.
+  const picked = urls.slice(0, 4);
+  const settled = await mapLimit(picked, 2, (u) => observeUrl(watch, u, deadline, { allowBrowser: false }));
+  let seen = settled.filter((s) => s.ok).map((s) => s.value);
+
+  // Only if NOTHING was readable is a browser worth opening, and then only for
+  // one page, with a hard ceiling so a hung extraction cannot hold a session
+  // open indefinitely.
+  const allEmpty = !seen.length || seen.every((o) => observationIsEmpty(watch, o));
+  if (allEmpty) {
+    const target = seen[0]?.url ?? picked[0];
+    console.log(`[watch] nothing readable by fetch; one browser attempt at ${hostOf(target)}`);
+    try {
+      const viaBrowser = await withTimeout(
+        observeViaBrowser(watch, target),
+        Number(WATCH_BROWSER_TIMEOUT_MS),
+        `watch browser ${hostOf(target)}`,
+      );
+      if (!observationIsEmpty(watch, viaBrowser)) {
+        viaBrowser.neededBrowser = true;
+        return viaBrowser;
+      }
+    } catch (err) {
+      console.warn(`[watch] browser read failed: ${clamp(err.message, 70)}`);
+    }
+  }
+
   if (!seen.length) {
     const why = settled.find((s) => !s.ok)?.error?.message ?? "no readable page";
     throw new Error(why);
@@ -2861,11 +2893,15 @@ async function createWatchTurn(sender, request, mem) {
   // says notify, because firing on the clock is the point. Saying "that's
   // already true" to "text me the price every 15 minutes" reads as a
   // non-sequitur, so confirm the schedule instead.
-  if (created.lifecycle.fireMode === "recurring") {
-    watches.update(created.id, {
-      nextCheckAt: Date.now() + created.schedule.everyMs,
-    });
-    return `Got it - I'll text you ${created.label} ${fmtEvery(created.schedule.everyMs)}${until}.${now ? `\n\nRight now: ${now}.` : ""}`;
+  // One branch, not two. A weather watch is both a digest and recurring, so it
+  // hit the recurring test first and never reached the near-identical digest
+  // copy below - including the full-stop fix that only lived there.
+  if (created.lifecycle.fireMode === "recurring" || created.kind === "digest") {
+    watches.update(created.id, { nextCheckAt: Date.now() + created.schedule.everyMs });
+    // A reading is already a sentence and usually ends in a full stop, so the
+    // template must not add a second: "0% chance of rain..".
+    const reading = now ? `\n\nRight now: ${now.replace(/\.\s*$/, "")}.` : "";
+    return `Got it - I'll text you ${created.label} ${fmtEvery(created.schedule.everyMs)}${until}.${reading}`;
   }
 
   if (verdict.notify) {
@@ -2878,11 +2914,6 @@ async function createWatchTurn(sender, request, mem) {
   }
 
   const c = created.condition;
-  if (created.kind === "digest") {
-    // A digest summary is already a sentence and usually ends in a full stop;
-    // appending another gives "0% chance of rain..".
-    return `Got it - I'll text you ${created.label} ${fmtEvery(created.schedule.everyMs)}${until}.${now ? `\n\nRight now: ${now.replace(/\.$/, "")}.` : ""}`;
-  }
   const cond =
     c.op === "drops_pct" ? `drops ${c.pct}%`
     : c.op === "becomes" ? `it's ${String(c.target).replace(/_/g, " ")}`
@@ -3743,6 +3774,27 @@ sweepArtifacts();
 setInterval(() => {
   runWatchTick().catch((err) => console.warn(`[watch] tick error: ${err.message}`));
 }, Number(WATCH_TICK_MS));
+
+/**
+ * Stay up.
+ *
+ * A request handler that throws costs one reply; this process dying costs every
+ * watch on it, silently, until someone notices the texts stopped. That
+ * asymmetry is the argument for catching here rather than exiting - a watcher
+ * that is not running is not watching, and nothing announces it.
+ *
+ * Narrow on purpose: log and keep serving. Watch state lives in SQLite and is
+ * already committed, so carrying on loses nothing in flight. This cannot catch
+ * a native abort - a libuv assertion during socket teardown still takes the
+ * process down - which is why the browser escalation is bounded rather than
+ * relying on this.
+ */
+process.on("uncaughtException", (err) => {
+  console.error(`[fatal] uncaught, staying up: ${err?.stack ?? err}`);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`[fatal] unhandled rejection, staying up: ${reason?.stack ?? reason}`);
+});
 
 app.listen(PORT, () => {
   console.log(`linq-browser-agent listening on http://localhost:${PORT}`);
