@@ -27,7 +27,7 @@ import Browserbase from "@browserbasehq/sdk";
 
 import { openStore } from "./store.js";
 import {
-  parseAmount, parseUnit, parseInterval, evaluate, describe as describeFire,
+  parseAmount, parseUnit, parseInterval, parseDuration, evaluate, describe as describeFire,
   inWindow, deferPastQuietHours, jitter, backoffFor,
   MIN_INTERVAL_MS, DEFAULT_INTERVAL_MS, HOUR, DAY,
 } from "./watch.js";
@@ -992,7 +992,10 @@ const WatchSchema = z.object({
         "every_change: tell them each time it happens. " +
         "recurring: a scheduled update regardless of change, e.g. 'the price every morning'.",
     ),
-  untilPhrase: z.string().nullable().describe('An end date if they gave one: "until Oct 4". Else null.'),
+  untilPhrase: z
+    .string()
+    .nullable()
+    .describe('When to stop, in their words - a duration ("for the next hour", "for 3 days") or a date ("until Oct 4"). Null if they did not say.'),
 });
 
 const WATCH_SYSTEM = `You turn one request into a monitoring job for an SMS assistant.
@@ -2459,7 +2462,10 @@ function watchFromSpec(sender, spec, mem) {
   }
 
   const everyMs = parseInterval(spec.everyPhrase, defaultIntervalFor(spec));
-  const expiresAt = parseDateish(spec.untilPhrase);
+  // "for the next hour" is a duration, "until Oct 4" is a date. Only handling
+  // the second meant "text me every 15 min for the next hour" produced a watch
+  // with no ending at all.
+  const expiresAt = parseDuration(spec.untilPhrase) ?? parseDateish(spec.untilPhrase);
 
   return {
     sender,
@@ -2616,13 +2622,20 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
 
   // Cooldown and quiet hours both defer rather than drop: an alert that never
   // arrives is indistinguishable from a broken watch.
+  //
+  // The cooldown exists to stop a value flickering across a threshold from
+  // becoming a stream of texts. A recurring digest is not that - the user chose
+  // the cadence, and "every 15 minutes" quietly becoming every 30 is the system
+  // overriding an explicit instruction. Exempt, and likewise for quiet hours:
+  // someone who asked for updates through the night gets them.
+  const recurring = w.lifecycle?.fireMode === "recurring";
   const sinceLast = now - (w.lastNotifiedAt ?? 0);
-  if (sinceLast < Number(WATCH_NOTIFY_COOLDOWN_MS)) {
+  if (!recurring && sinceLast < Number(WATCH_NOTIFY_COOLDOWN_MS)) {
     patch.nextCheckAt = (w.lastNotifiedAt ?? now) + Number(WATCH_NOTIFY_COOLDOWN_MS);
     watches.update(w.id, patch);
     return { notified: false, reason: "within cooldown" };
   }
-  const sendAt = deferPastQuietHours(now, schedule.quietHours);
+  const sendAt = recurring ? now : deferPastQuietHours(now, schedule.quietHours);
   if (sendAt > now) {
     patch.nextCheckAt = sendAt;
     watches.update(w.id, patch);
@@ -2718,6 +2731,23 @@ async function createWatchTurn(sender, request, mem) {
 
   const verdict = evaluate({ ...created, condition: patch.condition ?? created.condition }, null, obs);
   const now = describeFire({ ...created, condition: patch.condition ?? created.condition }, obs);
+  const until = created.lifecycle.expiresAt
+    ? ` until ${new Date(created.lifecycle.expiresAt)
+        .toLocaleString("en-CA", { hour: "numeric", minute: "2-digit", month: "short", day: "numeric" })
+        // en-CA renders "6:29 p.m.", and the sentence adds its own full stop.
+        .replace(/\.$/, "")}`
+    : "";
+
+  // A recurring watch has no condition to be "already true" - evaluate always
+  // says notify, because firing on the clock is the point. Saying "that's
+  // already true" to "text me the price every 15 minutes" reads as a
+  // non-sequitur, so confirm the schedule instead.
+  if (created.lifecycle.fireMode === "recurring") {
+    watches.update(created.id, {
+      nextCheckAt: Date.now() + created.schedule.everyMs,
+    });
+    return `Got it - I'll text you ${created.label} ${fmtEvery(created.schedule.everyMs)}${until}.${now ? `\n\nRight now: ${now}.` : ""}`;
+  }
 
   if (verdict.notify) {
     watches.update(created.id, {
@@ -2735,7 +2765,7 @@ async function createWatchTurn(sender, request, mem) {
     : c.op === "within_days" ? `the deadline is ${c.leadDays} days out`
     : c.op === "appears" ? "it shows up"
     : `it's ${{ lt: "under", lte: "at or under", gt: "over", gte: "at or over" }[c.op] ?? c.op} ${c.unit ? c.unit + " " : ""}${c.value}`;
-  return `Watching "${created.label}" - I'll text you when ${cond}. Checking ${fmtEvery(created.schedule.everyMs)}.${now ? `\n\nRight now: ${now}.` : ""}`;
+  return `Watching "${created.label}" - I'll text you when ${cond}. Checking ${fmtEvery(created.schedule.everyMs)}${until}.${now ? `\n\nRight now: ${now}.` : ""}`;
 }
 
 /** List, cancel, retune or force a check. */

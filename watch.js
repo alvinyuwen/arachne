@@ -152,6 +152,39 @@ export function parseInterval(text, fallback = DEFAULT_INTERVAL_MS) {
   return fallback;
 }
 
+/**
+ * "for the next hour" -> a timestamp an hour from now.
+ *
+ * People bound a watch by duration far more often than by date - "for the next
+ * hour", "for a couple of days", "this week". Treating only dates as an ending
+ * meant a request that explicitly said when to stop produced a watch that ran
+ * forever, which is the difference between a useful alert and a nuisance.
+ */
+export function parseDuration(text, now = Date.now()) {
+  const s = String(text ?? "").toLowerCase().trim();
+  if (!s) return null;
+
+  const words = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
+    seven: 7, eight: 8, nine: 9, ten: 10, "a couple of": 2, "a few": 3, couple: 2, few: 3 };
+
+  const m = s.match(
+    /(?:for|over|during)?\s*(?:the\s+)?(?:next\s+)?(\d+(?:\.\d+)?|a couple of|a few|[a-z]+)?\s*(minute|min|hour|hr|day|week|month)s?\b/,
+  );
+  if (!m) return null;
+
+  const n = m[1] == null ? 1 : Number.isFinite(Number(m[1])) ? Number(m[1]) : words[m[1]];
+  if (!n) return null;
+
+  const unit = m[2];
+  const ms =
+    /^(minute|min)/.test(unit) ? MINUTE
+    : /^(hour|hr)/.test(unit) ? HOUR
+    : unit === "day" ? DAY
+    : unit === "week" ? 7 * DAY
+    : 30 * DAY;
+  return now + n * ms;
+}
+
 /* ------------------------------------------------------------------ */
 /* Schedule                                                            */
 /* ------------------------------------------------------------------ */

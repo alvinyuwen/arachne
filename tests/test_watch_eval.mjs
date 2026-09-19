@@ -9,7 +9,7 @@
  * Run:  node tests/test_watch_eval.mjs     (no server needed)
  */
 import {
-  parseAmount, parseUnit, parseInterval, evaluate, inWindow,
+  parseAmount, parseUnit, parseInterval, parseDuration, evaluate, inWindow,
   deferPastQuietHours, backoffFor, jitter,
   MINUTE, HOUR, DAY, MIN_INTERVAL_MS, DEFAULT_INTERVAL_MS,
 } from "../watch.js";
@@ -67,6 +67,26 @@ eq("empty falls back", parseInterval(""), DEFAULT_INTERVAL_MS);
 eq('"every 10 seconds" is floored', parseInterval("every 10 seconds"), DEFAULT_INTERVAL_MS);
 eq('"constantly" is floored', parseInterval("constantly"), MIN_INTERVAL_MS);
 eq('"every 1 minute" is floored', parseInterval("every 1 minute"), MIN_INTERVAL_MS);
+
+/* ---------------------------------------------------------------- */
+console.log("\nparseDuration - how people actually bound a watch\n");
+
+{
+  const T0 = 1_700_000_000_000;
+  const d = (s) => parseDuration(s, T0);
+  // From a real message: "text me the update every 15 min for the next hour".
+  // This returning null is what made that watch run forever.
+  eq('"for the next hour"', d("for the next hour"), T0 + HOUR);
+  eq('"for the next 2 hours"', d("for the next 2 hours"), T0 + 2 * HOUR);
+  eq('"for 3 days"', d("for 3 days"), T0 + 3 * DAY);
+  eq('"for a week"', d("for a week"), T0 + 7 * DAY);
+  eq('"for a couple of days"', d("for a couple of days"), T0 + 2 * DAY);
+  eq('"for the next 30 minutes"', d("for the next 30 minutes"), T0 + 30 * MINUTE);
+  eq('"over the next month"', d("over the next month"), T0 + 30 * DAY);
+  eq("no duration is null", d("until further notice"), null);
+  eq("empty is null", d(""), null);
+  eq("null is null", d(null), null);
+}
 
 /* ---------------------------------------------------------------- */
 console.log("\nevaluate: numeric threshold - the flagship case\n");
