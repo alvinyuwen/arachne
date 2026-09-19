@@ -216,11 +216,23 @@ function toStrictJsonSchema(schema) {
   return stripUnsupported(z.toJSONSchema(schema, { io: "output" }));
 }
 
-/** Clamp at a word boundary so text never ends mid-word. */
+/**
+ * Clamp without ending mid-word, and preferably not mid-sentence.
+ *
+ * A model asked for one line often writes two, and cutting the second one open
+ * reads worse than not having it: "shows 687 followers and 801 following. The
+ * profile name shown is…" invites a follow-up question about a fact that was
+ * never going to arrive. If a sentence ends in the last part of the budget,
+ * stop there and drop the trailing "…" - the text is then complete, not cut.
+ */
 function clamp(s, n) {
   const str = String(s ?? "");
   if (str.length <= n) return str;
   const cut = str.slice(0, n - 1);
+
+  const sentence = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+  if (sentence > n * 0.5) return cut.slice(0, sentence + 1);
+
   const space = cut.lastIndexOf(" ");
   return `${(space > n * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
@@ -2231,7 +2243,16 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
     recordTurn(senderNumber, "user", safeText, "refusal");
     recordTurn(senderNumber, "assistant", CREDENTIAL_REFUSAL, "refusal");
     await send(senderNumber, [{ type: "text", value: CREDENTIAL_REFUSAL }]);
-    return;
+    // Returned rather than falling out as undefined so /debug/turn can tell
+    // this apart from a completed run, which also reports no route. A test
+    // asserting "route === null" here would have passed against anything.
+    return {
+      mode: "refuse_credentials",
+      reasoning: "secret redacted before routing; no model call made",
+      reply: CREDENTIAL_REFUSAL,
+      resolvedRequest: "",
+      referencesPriorResult: false,
+    };
   }
 
   const mem = recordTurn(senderNumber, "user", safeText, "user");

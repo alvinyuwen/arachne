@@ -64,14 +64,18 @@ for (const [text, expected] of solo) {
     `asked: ${asked}`);
 }
 
-// An actual secret is refused before the router runs at all. route === null is
-// the assertion that matters: it means routeTurn was never reached, so the
-// password never entered a prompt. tests/test_redaction.mjs covers the regex
-// itself, including the sentences that must NOT trip it.
+// An actual secret is refused before the router runs at all.
+//
+// The elapsed time is the assertion that carries weight: routeTurn is a network
+// round trip to OpenAI and cannot finish in a quarter second, so a turn this
+// fast proves the password never entered a prompt. The mode alone would not -
+// the router could have returned the same mode after seeing the secret.
+// tests/test_redaction.mjs covers the regex itself, in both directions.
 {
   const r = await turn(NUM, "my password is hunter2", { reset: true, routeOnly: false });
-  check("a texted password refuses with zero model calls", r.route === null,
+  check("a texted password refuses", r.route?.mode === "refuse_credentials",
     `route: ${JSON.stringify(r.route)}`);
+  check("...and does it with zero model calls", r.elapsedMs < 250, `took ${r.elapsedMs}ms`);
   check("the refusal is the only thing sent", r.sends === 1, `sends=${r.sends}`);
 
   const mem = await fetch(`${BASE}/debug/memory?from=${encodeURIComponent(NUM)}`, {
