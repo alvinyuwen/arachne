@@ -51,6 +51,13 @@ check("the browser is phone-shaped", out.viewport?.width <= 430 && out.viewport?
 check("the link is the fullscreen live view", out.liveUrlKind === "fullscreen",
   `kind: ${out.liveUrlKind}`);
 
+// The handoff message tells the user how long they have, and pendingLogin waits
+// that long for a "done". Both were 30 minutes while the session was dying
+// after the project default of 5, so the browser was gone well before the
+// agent stopped waiting for it.
+check("the session lives as long as the message promises", out.lifetimeMin >= 30,
+  `session lasts ${out.lifetimeMin} min`);
+
 console.log();
 const passed = results.filter(Boolean).length;
 console.log(passed === results.length

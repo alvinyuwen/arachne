@@ -1774,10 +1774,24 @@ function cdpConnect(wsUrl, { timeoutMs = 20000 } = {}) {
  */
 const LOGIN_VIEWPORT = { width: 390, height: 844 };
 
+/**
+ * How long the sign-in browser stays up, in seconds.
+ *
+ * The project default is 300. keepAlive stops the session ending when this
+ * process disconnects, but it does not extend that timeout, so the browser was
+ * dying after five minutes while the handoff message promised thirty and
+ * pendingLogin kept waiting for a "done" that could no longer land. Signing in
+ * on a phone - finding the password manager, switching apps, coming back -
+ * routinely takes longer than five minutes, which is exactly the case this is
+ * meant to serve.
+ */
+const LOGIN_SESSION_SECONDS = 1800;
+
 async function startLoginSession(sender, url) {
   const contextId = await ensureContext(sender);
   const browser = await launchSession({
     keepAlive: true,
+    timeout: LOGIN_SESSION_SECONDS,
     browserSettings: {
       context: { id: contextId, persist: true },
       viewport: LOGIN_VIEWPORT,
@@ -2655,10 +2669,16 @@ app.post("/debug/login", async (req, res) => {
   try {
     handoff = await startLoginSession(from, url);
     const live = await bb.sessions.debug(handoff.sessionId);
+    const meta = await bb.sessions.retrieve(handoff.sessionId);
     res.json({
       elapsedMs: Date.now() - started,
       parked: handoff.parked,
       landedOn: live.pages?.[0]?.url ?? null,
+      // The message promises the user a window to sign in; this is the number
+      // that has to back it up.
+      lifetimeMin: Math.round(
+        (new Date(meta.expiresAt) - new Date(meta.startedAt)) / 60000,
+      ),
       // The live URL itself is withheld on purpose: it is a bearer handle to a
       // running browser and this response is easy to paste somewhere.
       liveUrlKind: handoff.liveUrl?.includes("/devtools-fullscreen/") ? "fullscreen" : "other",
