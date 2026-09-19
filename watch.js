@@ -360,6 +360,9 @@ export function describe(watch, obs) {
   const what = metric || "it";
   if (kind === "numeric") {
     const v = num(obs);
+    // "price is CAD null" is what printing an unread value looks like. Say the
+    // true thing instead - the caller decides whether that is worth sending.
+    if (v == null) return "";
     const unit = obs?.unit ? `${obs.unit} ` : "";
     if (condition.op === "drops_pct") return `${what} fell ${condition.pct}% or more (now ${unit}${v})`;
     if (condition.op === "rises_pct") return `${what} rose ${condition.pct}% or more (now ${unit}${v})`;
