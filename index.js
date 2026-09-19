@@ -485,7 +485,21 @@ function verifyWebhookSignature(req) {
   const matched = provided.some(
     (sig) => sig.length === expected.length && crypto.timingSafeEqual(sig, expected),
   );
-  return matched ? { ok: true } : { ok: false, reason: "signature mismatch" };
+  if (matched) return { ok: true };
+
+  // Every inbound message in production produced exactly one accepted webhook
+  // and one rejected one - 4 and 4 - which is the signature of a second
+  // endpoint configured in Linq against the same URL, signing with its own
+  // secret. Naming the id and the event makes that checkable in their dashboard
+  // instead of guessable. The digests are truncated: they are not secret, but
+  // full ones invite someone to try matching them offline.
+  const short = (b) => b.toString("base64").slice(0, 8);
+  return {
+    ok: false,
+    reason:
+      `signature mismatch (webhook-id ${id}, event ${req.body?.type ?? "?"}, ` +
+      `got ${provided.map(short).join("/") || "none"}, expected ${short(expected)})`,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1702,6 +1716,33 @@ async function ensureContext(sender) {
 }
 
 /**
+ * Which hosts a sender has actually completed a sign-in for.
+ *
+ * Separate from senderContexts on purpose. A context is created at the START of
+ * a handoff, so "has a context" answers "did they ever begin signing in", not
+ * "are they signed in". Using it as the offer guard meant one failed attempt
+ * permanently silenced the offer - the browser kept hitting the same wall and
+ * the agent kept quietly returning public results instead.
+ *
+ * One cookie jar per sender still serves every host; this only tracks which of
+ * them the jar actually holds a session for.
+ */
+const senderSignedIn = new Map();
+
+function hasSignedIn(sender, host) {
+  return Boolean(host) && Boolean(senderSignedIn.get(sender)?.has(host));
+}
+
+function markSignedIn(sender, host) {
+  if (!host) return;
+  const hosts = senderSignedIn.get(sender) ?? new Set();
+  hosts.add(host);
+  senderSignedIn.set(sender, hosts);
+  console.log(`[login] ${sender} now signed in to ${host}`);
+}
+
+
+/**
  * A minimal Chrome DevTools Protocol client over the session's websocket.
  *
  * Stagehand cannot be used to park the login session. It drives pages through
@@ -2444,7 +2485,18 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
         const research = await runResearchTier(classification, deadline, { minSources: 1 });
         // Remember which host blocked us, so the reply can offer to sign in
         // rather than just reporting a thinner answer.
-        result = { ...research, screenshots: result.screenshots, blockedHost };
+        //
+        // blockedUrl is the page that actually turned us away, kept alongside
+        // the host because the handoff needs to park on it. Synthesising
+        // https://<host> instead sent the user to instagram.com's homepage
+        // when the wall was at /accounts/login/?next=/direct/inbox/ - losing
+        // both the sign-in form and the return path to what they asked for.
+        result = {
+          ...research,
+          screenshots: result.screenshots,
+          blockedHost,
+          blockedUrl: result.authWall.url || null,
+        };
       }
     } catch (err) {
       console.warn(`[browser] tier failed (${err.message}), falling back to research`);
@@ -2475,6 +2527,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
     classification.targetUrl
   ) {
     result.blockedHost = hostOf(classification.targetUrl);
+    result.blockedUrl = classification.targetUrl;
     console.log(`[auth] extraction reports ${result.blockedHost} needs a login`);
   }
 
@@ -2499,6 +2552,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
   return {
     text,
     blockedHost: result.blockedHost ?? null,
+    blockedUrl: result.blockedUrl ?? null,
     screenshots: screenshots.slice(0, 1),
     tier: result.tier,
     taskType: classification.taskType,
@@ -2713,6 +2767,10 @@ Text me "done" when you're in and I'll pick the task back up. ` +
   if (login?.stage === "waiting" && LOGIN_CONFIRM_RE.test(safeText)) {
     await finishLoginSession(login.sessionId);
     mem.pendingLogin = null;
+    // Taken at their word here, unlike the unlock route which can check the
+    // page. If they were wrong the next run hits the wall again and, now that
+    // the guard tracks sign-ins rather than contexts, offers again.
+    markSignedIn(senderNumber, login.host);
     console.log(`[login] resuming "${clamp(login.request, 60)}" with a signed-in context`);
     if (shouldAck("product_research", "browser")) {
       await send(senderNumber, [{ type: "text", value: "Thanks - picking that back up now." }]);
@@ -2828,18 +2886,24 @@ Text me "done" when you're in and I'll pick the task back up. ` +
   // Something turned us away at a login. Offer the handover rather than
   // starting a browser speculatively: standing one up costs a session, and the
   // user may be perfectly happy with the public answer they just got.
-  if (result.blockedHost && !senderContexts.has(senderNumber)) {
+  //
+  // Gated on whether this host has actually been signed into, not on whether a
+  // context exists. Those came apart in practice: creating the context is the
+  // first step of a handoff, so a handoff that then FAILED still suppressed
+  // every future offer. The user asked "can you log me in and check my DMs"
+  // twice after a failed sign-in and got a public-sources answer both times,
+  // with no offer and nothing explaining why.
+  if (result.blockedHost && !hasSignedIn(senderNumber, result.blockedHost)) {
     mem.pendingLogin = {
       stage: "offered",
       host: result.blockedHost,
-      url: `https://${result.blockedHost}`,
+      url: result.blockedUrl || `https://${result.blockedHost}`,
       request,
       at: Date.now(),
     };
     const offer =
       `That one's behind a login on ${result.blockedHost}. Reply "login" and I'll send ` +
-      `you a link to sign in yourself - the password goes straight to ${result.blockedHost}, ` +
-      `never through me - and after that I can keep using the session.`;
+      `you a link to sign in yourself - and after that I can keep using the session.`;
     recordTurn(senderNumber, "assistant", offer, "task");
     await send(senderNumber, [{ type: "text", value: offer }]);
   }
@@ -3038,6 +3102,7 @@ app.post("/unlock/:token", async (req, res) => {
   }
 
   console.log(`[unlock] ${entry.host} signed in for ${entry.sender}`);
+  markSignedIn(entry.sender, entry.host);
   res.json({ ok: true });
 
   // Bank the cookies and pick the task back up, after responding - the phone
