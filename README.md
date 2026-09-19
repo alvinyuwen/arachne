@@ -39,6 +39,7 @@ Configuration lives in `.env` (see `.env.example`):
 | `LINQ_API_KEY` | Bearer token for Linq's outbound message API |
 | `LINQ_PHONE_NUMBER` | The agent's own number (reported by `/health`) |
 | `LINQ_API_URL` | Defaults to `https://api.linqapp.com/api/partner/v3/messages` |
+| `LINQ_WEBHOOK_SECRET` | `whsec_...` signing secret. Unset = unsigned requests accepted |
 | `BROWSERBASE_API_KEY` | Browserbase auth |
 | `BROWSERBASE_PROJECT_ID` | **Required.** From <https://www.browserbase.com/settings> |
 | `PORT` | HTTP port, default `3000` |
@@ -81,7 +82,23 @@ ngrok v3 needs an authtoken once per machine:
 | `GET` | `/last_action.png` | Latest screenshot, served from `./public` |
 | `GET` | `/` | Service banner |
 
+## Webhook security
+
+Inbound webhooks are verified against the [Standard Webhooks](https://www.standardwebhooks.com/)
+spec that Linq signs with: HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{raw body}`,
+keyed by the base64-decoded `whsec_` secret, compared in constant time, with a
+300-second replay window. Anything that fails gets a `401`.
+
+This matters because the endpoint is publicly reachable through the tunnel —
+without it, anyone who learned the URL could trigger Browserbase sessions and
+outbound messages on your account.
+
+Leaving `LINQ_WEBHOOK_SECRET` unset disables the check (and logs a warning at
+startup), which is only appropriate for local testing.
+
 ## Testing without iMessage
+
+With `LINQ_WEBHOOK_SECRET` unset, a plain request works:
 
 ```bash
 curl -X POST http://localhost:3000/webhook/linq \
@@ -91,6 +108,10 @@ curl -X POST http://localhost:3000/webhook/linq \
 
 The webhook accepts both the flat shape above and Linq's real v3 envelope
 (`data.sender_handle.handle` + `data.parts[].value`).
+
+With the secret set, requests must carry valid `webhook-id`,
+`webhook-timestamp` and `webhook-signature` headers. Note that a request which
+passes verification runs a real browser task and bills a Browserbase session.
 
 ## Notes
 
