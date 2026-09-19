@@ -9,9 +9,9 @@
  * Run:  node tests/test_watch_eval.mjs     (no server needed)
  */
 import {
-  parseAmount, parseUnit, parseInterval, parseDuration, evaluate, inWindow,
+  parseAmount, parseUnit, evaluate, inWindow,
   deferPastQuietHours, backoffFor, jitter,
-  MINUTE, HOUR, DAY, MIN_INTERVAL_MS, DEFAULT_INTERVAL_MS,
+  MINUTE, HOUR, DAY, MIN_INTERVAL_MS,
 } from "../watch.js";
 
 const results = [];
@@ -48,45 +48,6 @@ eq('"Price unavailable" is null', parseAmount("Price unavailable"), null);
 eq('unit of "CAD $79.99"', parseUnit("CAD $79.99"), "CAD");
 eq('unit of "€49"', parseUnit("€49"), "EUR");
 eq('unit of "23 spots"', parseUnit("23 spots"), null);
-
-/* ---------------------------------------------------------------- */
-console.log("\nparseInterval - cadence is restated casually and must not cost a round trip\n");
-
-eq('"hourly"', parseInterval("hourly"), HOUR);
-eq('"every hour"', parseInterval("every hour"), HOUR);
-eq('"daily"', parseInterval("check it daily"), DAY);
-eq('"every morning"', parseInterval("every morning"), DAY);
-eq('"weekly"', parseInterval("weekly"), 7 * DAY);
-eq('"twice a day"', parseInterval("twice a day"), 12 * HOUR);
-eq('"every 15 minutes"', parseInterval("every 15 minutes"), 15 * MINUTE);
-eq('"every 3 days"', parseInterval("every 3 days"), 3 * DAY);
-eq('"every other day"', parseInterval("every other day"), 2 * DAY);
-eq("unrecognised falls back", parseInterval("whenever you feel like it"), DEFAULT_INTERVAL_MS);
-eq("empty falls back", parseInterval(""), DEFAULT_INTERVAL_MS);
-// Nobody gets to create a hot loop against someone else's website.
-eq('"every 10 seconds" is floored', parseInterval("every 10 seconds"), DEFAULT_INTERVAL_MS);
-eq('"constantly" is floored', parseInterval("constantly"), MIN_INTERVAL_MS);
-eq('"every 1 minute" is floored', parseInterval("every 1 minute"), MIN_INTERVAL_MS);
-
-/* ---------------------------------------------------------------- */
-console.log("\nparseDuration - how people actually bound a watch\n");
-
-{
-  const T0 = 1_700_000_000_000;
-  const d = (s) => parseDuration(s, T0);
-  // From a real message: "text me the update every 15 min for the next hour".
-  // This returning null is what made that watch run forever.
-  eq('"for the next hour"', d("for the next hour"), T0 + HOUR);
-  eq('"for the next 2 hours"', d("for the next 2 hours"), T0 + 2 * HOUR);
-  eq('"for 3 days"', d("for 3 days"), T0 + 3 * DAY);
-  eq('"for a week"', d("for a week"), T0 + 7 * DAY);
-  eq('"for a couple of days"', d("for a couple of days"), T0 + 2 * DAY);
-  eq('"for the next 30 minutes"', d("for the next 30 minutes"), T0 + 30 * MINUTE);
-  eq('"over the next month"', d("over the next month"), T0 + 30 * DAY);
-  eq("no duration is null", d("until further notice"), null);
-  eq("empty is null", d(""), null);
-  eq("null is null", d(null), null);
-}
 
 /* ---------------------------------------------------------------- */
 console.log("\nevaluate: numeric threshold - the flagship case\n");
@@ -301,10 +262,11 @@ eq("no failures means no backoff", backoffFor(HOUR, 0), HOUR);
   // Jitter exists to stop watches stampeding a site. Applied to a cadence
   // someone said out loud it becomes a broken promise: "every 15 minutes"
   // arriving at 18 reads as not working, which is exactly how it was reported.
+  // nextDelay() in index.js is what bypasses it for a stated cadence; this
+  // asserts the thing it is bypassing actually moves the number.
   const stated = 15 * MINUTE;
-  check("a stated cadence must be reproducible to the minute",
-    jitter(stated, () => 0) !== stated && jitter(stated, () => 1) !== stated,
-    "jitter should move it - which is why exact schedules must bypass it");
+  check("jitter does move a cadence, which is why exact schedules skip it",
+    jitter(stated, () => 0) !== stated && jitter(stated, () => 1) !== stated);
 }
 
 /* ---------------------------------------------------------------- */

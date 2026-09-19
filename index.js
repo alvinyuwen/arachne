@@ -27,7 +27,7 @@ import Browserbase from "@browserbasehq/sdk";
 
 import { openStore } from "./store.js";
 import {
-  parseAmount, parseUnit, parseInterval, parseDuration, evaluate, describe as describeFire,
+  parseAmount, parseUnit, evaluate, describe as describeFire,
   inWindow, deferPastQuietHours, jitter, backoffFor,
   MIN_INTERVAL_MS, DEFAULT_INTERVAL_MS, HOUR, DAY,
 } from "./watch.js";
@@ -1021,10 +1021,14 @@ const WatchSchema = z.object({
   target: z.string().nullable().describe('Target label for `becomes`, e.g. "in_stock", "open". Else null.'),
   leadDays: z.number().nullable().describe("For within_days: how many days of warning. Else null."),
   unit: z.string().nullable().describe('Currency or unit, e.g. "CAD", "USD". Null if not stated.'),
-  everyPhrase: z
-    .string()
+  everyMinutes: z
+    .number()
     .nullable()
-    .describe('How often, in their words: "hourly", "daily", "every 15 minutes". Null if unsaid.'),
+    .describe(
+      "How often to check, in MINUTES. Convert whatever they said: hourly = 60, " +
+        "daily = 1440, twice a day = 720, every 15 min = 15, weekly = 10080. " +
+        "Null if they did not say how often.",
+    ),
   fireMode: z
     .enum(["once", "every_change", "recurring"])
     .describe(
@@ -1032,10 +1036,16 @@ const WatchSchema = z.object({
         "every_change: tell them each time it happens. " +
         "recurring: a scheduled update regardless of change, e.g. 'the price every morning'.",
     ),
-  untilPhrase: z
+  endsAt: z
     .string()
     .nullable()
-    .describe('When to stop, in their words - a duration ("for the next hour", "for 3 days") or a date ("until Oct 4"). Null if they did not say.'),
+    .describe(
+      "When to stop, as a full ISO 8601 timestamp with offset, resolved against the " +
+        "current time given above. Cover every way of saying it: a duration " +
+        '("for the next hour"), a clock time ("until 7", "till 9:30pm"), a day ' +
+        '("until Friday") or a date ("until Oct 4"). For a bare hour with no am/pm, ' +
+        "pick whichever comes round first. Null only if they gave no ending at all.",
+    ),
 });
 
 const WATCH_SYSTEM = `You turn one request into a monitoring job for an SMS assistant.
@@ -1074,7 +1084,7 @@ const ManageSchema = z.object({
     .string()
     .describe('Which watch they mean, in their words: "the keyboard", "all of them", "" if unclear'),
   value: z.number().nullable().describe("New threshold for update. Else null."),
-  everyPhrase: z.string().nullable().describe("New schedule for update. Else null."),
+  everyMinutes: z.number().nullable().describe("New cadence in MINUTES for update. Else null."),
 });
 
 const MANAGE_SYSTEM = `You interpret a message about monitoring jobs that already exist.
@@ -2610,17 +2620,7 @@ function watchFromSpec(sender, spec, mem) {
     }
   }
 
-  const everyMs = parseInterval(spec.everyPhrase, defaultIntervalFor(spec));
-  // Jitter spreads load across watches that would otherwise fire together, but
-  // it has no business moving a cadence someone chose out loud. At +/-20% a
-  // stated "every 15 minutes" arrives anywhere from 12 to 18, and the first
-  // person to ask for exactly that checked at 15, saw nothing, and reported it
-  // broken. Only a cadence WE picked gets spread.
-  const exact = Boolean(spec.everyPhrase && spec.everyPhrase.trim());
-  // "for the next hour" is a duration, "until Oct 4" is a date. Only handling
-  // the second meant "text me every 15 min for the next hour" produced a watch
-  // with no ending at all.
-  const expiresAt = parseDuration(spec.untilPhrase) ?? parseDateish(spec.untilPhrase);
+  const { everyMs, exact, expiresAt } = normalizeSchedule(spec, defaultIntervalFor(spec));
 
   return {
     sender,
@@ -2679,6 +2679,45 @@ function defaultIntervalFor(spec) {
   if (spec.kind === "digest") return DAY;
   if (!spec.urls?.length && spec.searchQuery) return 12 * HOUR;
   return Number(WATCH_DEFAULT_INTERVAL_MS) || DEFAULT_INTERVAL_MS;
+}
+
+/**
+ * Bound what the model said about scheduling.
+ *
+ * The model reads the English - "until 7", "for the next hour", "hourly" - and
+ * returns a count of minutes and an ISO timestamp. Three hand-written parsers
+ * used to live here and each failed the same way: an unanticipated phrasing
+ * fell through every regex and silently became "no schedule", so a watch told
+ * to stop at 7 ran forever.
+ *
+ * What is left is the part that is a rule rather than an interpretation. A
+ * floor, because nobody gets to poll a stranger's website every ten seconds. A
+ * sanity check on the timestamp, because an unparseable or past date must read
+ * as "no ending" rather than "already over". These are cheap to state and
+ * cannot be argued with, which is exactly what a regex was not.
+ */
+function normalizeSchedule(spec, fallbackMs) {
+  const asked = Number(spec.everyMinutes);
+  const stated = Number.isFinite(asked) && asked > 0;
+  const everyMs = stated
+    ? Math.max(MIN_INTERVAL_MS, Math.round(asked * 60_000))
+    : Number(fallbackMs) || DEFAULT_INTERVAL_MS;
+
+  // Jitter spreads watches that would otherwise fire together, but it has no
+  // business moving a cadence someone chose out loud - at +/-20% a stated
+  // "every 15 minutes" lands anywhere from 12 to 18, and the person who asked
+  // for exactly that checked at 15, saw nothing, and reported it broken.
+  const exact = stated;
+
+  let expiresAt = null;
+  if (spec.endsAt) {
+    const t = Date.parse(spec.endsAt);
+    // A past or unreadable ending is no ending. Treating it as "already over"
+    // would silently kill a watch the moment it was created.
+    if (Number.isFinite(t) && t > Date.now()) expiresAt = t;
+    else console.warn(`[watch] ignoring unusable endsAt ${JSON.stringify(spec.endsAt)}`);
+  }
+  return { everyMs, exact, expiresAt };
 }
 
 /** How long until this watch is due again - exact if they named the cadence. */
@@ -2887,7 +2926,9 @@ async function createWatchTurn(sender, request, mem) {
   try {
     spec = await llmJSON({
       system: WATCH_SYSTEM,
-      user: `PREVIOUS RESULT:\n${renderLastTask(mem)}\n\nREQUEST: ${request}`,
+      // The clock is the one thing it cannot work out for itself, and every
+      // schedule phrase is relative to it.
+      user: `CURRENT TIME: ${new Date().toString()}\n\nPREVIOUS RESULT:\n${renderLastTask(mem)}\n\nREQUEST: ${request}`,
       schema: WatchSchema,
       schemaName: "watch",
       deadline: new Deadline(Number(ROUTER_TIMEOUT_MS)),
@@ -2975,7 +3016,7 @@ async function manageWatchTurn(sender, request, mem, send) {
   try {
     m = await llmJSON({
       system: MANAGE_SYSTEM,
-      user: `THEIR WATCHES:\n${mine.map((w, i) => `${i + 1}. ${watchLine(w)}`).join("\n")}\n\nMESSAGE: ${request}`,
+      user: `CURRENT TIME: ${new Date().toString()}\n\nTHEIR WATCHES:\n${mine.map((w, i) => `${i + 1}. ${watchLine(w)}`).join("\n")}\n\nMESSAGE: ${request}`,
       schema: ManageSchema,
       schemaName: "manage",
       deadline: new Deadline(Number(ROUTER_TIMEOUT_MS)),
@@ -3014,8 +3055,9 @@ async function manageWatchTurn(sender, request, mem, send) {
   if (m.action === "update") {
     const patch = {};
     if (m.value != null) patch.condition = { ...target.condition, value: m.value };
-    if (m.everyPhrase) {
-      patch.schedule = { ...target.schedule, everyMs: parseInterval(m.everyPhrase, target.schedule.everyMs) };
+    if (m.everyMinutes != null) {
+      const { everyMs, exact } = normalizeSchedule({ everyMinutes: m.everyMinutes }, target.schedule.everyMs);
+      patch.schedule = { ...target.schedule, everyMs, exact };
     }
     if (!Object.keys(patch).length) return `What should I change about ${target.label}?`;
     // A retuned threshold re-arms a watch that already fired.

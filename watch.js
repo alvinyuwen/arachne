@@ -124,72 +124,19 @@ export function parseUnit(text) {
 }
 
 /**
- * "check it hourly" -> 3600000.
+ * Schedules are read by the model, not parsed here.
  *
- * Deliberately a parser and not a model call: cadence is the one parameter a
- * user is most likely to restate casually ("actually make it daily"), and it
- * should not cost a round trip or be open to interpretation. Unrecognised
- * phrasing falls back to the default rather than erroring, because refusing to
- * create a watch over the word "biweekly" is worse than checking it daily.
- */
-export function parseInterval(text, fallback = DEFAULT_INTERVAL_MS) {
-  const s = String(text ?? "").toLowerCase().trim();
-  if (!s) return fallback;
-
-  if (/\b(constantly|continuously|all the time|asap|real ?time)\b/.test(s)) return MIN_INTERVAL_MS;
-  if (/\bevery ?other ?day|\bbiweekly|\bfortnight/.test(s)) return 2 * DAY;
-  if (/\b(hourly|every hour|each hour)\b/.test(s)) return HOUR;
-  if (/\b(daily|every day|each day|once a day|every morning|nightly)\b/.test(s)) return DAY;
-  if (/\b(weekly|every week|once a week)\b/.test(s)) return 7 * DAY;
-  if (/\btwice (a|per) day|\bevery 12 ?h/.test(s)) return 12 * HOUR;
-  if (/\btwice (a|per) hour\b/.test(s)) return 30 * MINUTE;
-
-  const every = s.match(/every\s+(\d+(?:\.\d+)?)\s*(minute|min|hour|hr|h|day|d|week|w)s?\b/);
-  if (every) {
-    const n = Number.parseFloat(every[1]);
-    const unit = every[2];
-    const ms =
-      /^(minute|min)/.test(unit) ? MINUTE
-      : /^(hour|hr|h)$/.test(unit) ? HOUR
-      : /^(day|d)$/.test(unit) ? DAY
-      : 7 * DAY;
-    if (Number.isFinite(n) && n > 0) return Math.max(MIN_INTERVAL_MS, n * ms);
-  }
-  return fallback;
-}
-
-/**
- * "for the next hour" -> a timestamp an hour from now.
+ * There used to be three hand-rolled parsers in this space - one for cadences,
+ * one for durations, one for clock times - and the way they failed was always
+ * the same: a form nobody had thought of fell through every regex and silently
+ * became "no schedule". "for the next hour" ran forever, then "until 7" ran
+ * forever, and each fix was another pattern rather than a different approach.
  *
- * People bound a watch by duration far more often than by date - "for the next
- * hour", "for a couple of days", "this week". Treating only dates as an ending
- * meant a request that explicitly said when to stop produced a watch that ran
- * forever, which is the difference between a useful alert and a nuisance.
+ * Reading English is what the model is for. It returns concrete numbers - a
+ * count of minutes, an ISO timestamp - and the only job left here is refusing
+ * values that are out of bounds, which is a rule rather than a guess. See
+ * normalizeSchedule in index.js.
  */
-export function parseDuration(text, now = Date.now()) {
-  const s = String(text ?? "").toLowerCase().trim();
-  if (!s) return null;
-
-  const words = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
-    seven: 7, eight: 8, nine: 9, ten: 10, "a couple of": 2, "a few": 3, couple: 2, few: 3 };
-
-  const m = s.match(
-    /(?:for|over|during)?\s*(?:the\s+)?(?:next\s+)?(\d+(?:\.\d+)?|a couple of|a few|[a-z]+)?\s*(minute|min|hour|hr|day|week|month)s?\b/,
-  );
-  if (!m) return null;
-
-  const n = m[1] == null ? 1 : Number.isFinite(Number(m[1])) ? Number(m[1]) : words[m[1]];
-  if (!n) return null;
-
-  const unit = m[2];
-  const ms =
-    /^(minute|min)/.test(unit) ? MINUTE
-    : /^(hour|hr)/.test(unit) ? HOUR
-    : unit === "day" ? DAY
-    : unit === "week" ? 7 * DAY
-    : 30 * DAY;
-  return now + n * ms;
-}
 
 /* ------------------------------------------------------------------ */
 /* Schedule                                                            */
