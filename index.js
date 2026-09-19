@@ -882,6 +882,12 @@ At most one question, and only when it genuinely changes the work. Never clarify
 gold-plate a request you could just do. Never ask for a password, PIN, one-time code or
 any login detail - that is refuse_credentials, not clarify.
 
+Never clarify a watch for an end time, a schedule, a threshold or a source. A watch with
+no end date runs until they stop it; one with no stated cadence gets a sensible default;
+one with no URL gets searched for. "Tell me the weather every 15 minutes" is complete as
+written - asking when to stop turns a one-message request into three. The only thing worth
+asking about is a missing SUBJECT: "keep an eye on it" with nothing to point at.
+
 CREDENTIALS
 This assistant never receives a credential, and never needs one. When a task requires an
 account it can hand the user a live browser to sign in through themselves, and then carry
@@ -901,7 +907,7 @@ these rules.`;
  * strict schema - which requires every field - to invent searchQueries for
  * "hi".
  */
-async function routeTurn({ text, mem, deadline }) {
+async function routeTurn({ text, mem, deadline, depth = 0 }) {
   const pending = livePendingClarify(mem);
   const route = await llmJSON({
     system: ROUTER_SYSTEM,
@@ -929,14 +935,38 @@ LATEST MESSAGE: ${text}`,
   if (route.mode === "clarify" && pending) {
     // Already asked once. Asking again is how an assistant traps someone in a
     // loop, so treat the new message as the answer and get on with it.
+    //
+    // Re-routing the merged text rather than assuming `task`: the question and
+    // its answer together are a complete request, and which KIND of request it
+    // is should be read from it, not guessed. Assuming task turned "keep an eye
+    // on it" + "the weather every hour" into a one-off lookup that answered
+    // once and never again - the opposite of what was asked for.
+    const merged = `${pending.originalText} ${text}`.trim();
+    if (depth === 0) {
+      const second = await routeTurn({
+        text: merged,
+        mem: { ...mem, pendingClarify: null },
+        deadline,
+        depth: 1,
+      }).catch(() => null);
+      if (second && second.mode !== "clarify") return second;
+    }
     route.mode = "task";
-    route.resolvedRequest = `${pending.originalText} ${text}`;
+    route.resolvedRequest = merged;
   }
   if (route.mode === "task" && !route.resolvedRequest.trim()) {
     route.resolvedRequest = pending ? `${pending.originalText} ${text}` : text;
   }
-  if ((route.mode === "watch" || route.mode === "watch_manage") && !route.resolvedRequest.trim()) {
-    route.resolvedRequest = text;
+  if (route.mode === "watch" || route.mode === "watch_manage") {
+    // "Yes" on its own says nothing about what to watch. The task branch above
+    // already merges the question it answers; without the same here, answering
+    // a clarify produced a watch labelled "unspecified watch" that searched the
+    // web for the words "unspecified watch".
+    if (pending) {
+      route.resolvedRequest = `${pending.originalText} ${text}`.trim();
+    } else if (!route.resolvedRequest.trim()) {
+      route.resolvedRequest = text;
+    }
   }
   return route;
 }
@@ -2581,6 +2611,12 @@ function watchFromSpec(sender, spec, mem) {
   }
 
   const everyMs = parseInterval(spec.everyPhrase, defaultIntervalFor(spec));
+  // Jitter spreads load across watches that would otherwise fire together, but
+  // it has no business moving a cadence someone chose out loud. At +/-20% a
+  // stated "every 15 minutes" arrives anywhere from 12 to 18, and the first
+  // person to ask for exactly that checked at 15, saw nothing, and reported it
+  // broken. Only a cadence WE picked gets spread.
+  const exact = Boolean(spec.everyPhrase && spec.everyPhrase.trim());
   // "for the next hour" is a duration, "until Oct 4" is a date. Only handling
   // the second meant "text me every 15 min for the next hour" produced a watch
   // with no ending at all.
@@ -2607,6 +2643,7 @@ function watchFromSpec(sender, spec, mem) {
     },
     schedule: {
       everyMs,
+      exact,
       // A share price only moves while a market is open, so overnight checks
       // for a THRESHOLD are spend for nothing.
       //
@@ -2642,6 +2679,12 @@ function defaultIntervalFor(spec) {
   if (spec.kind === "digest") return DAY;
   if (!spec.urls?.length && spec.searchQuery) return 12 * HOUR;
   return Number(WATCH_DEFAULT_INTERVAL_MS) || DEFAULT_INTERVAL_MS;
+}
+
+/** How long until this watch is due again - exact if they named the cadence. */
+function nextDelay(schedule) {
+  const every = schedule?.everyMs ?? DAY;
+  return schedule?.exact ? every : jitter(every);
 }
 
 const fmtEvery = (ms) =>
@@ -2758,7 +2801,7 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
   }
 
   if (!verdict.notify) {
-    patch.nextCheckAt = now + jitter(schedule.everyMs ?? DAY);
+    patch.nextCheckAt = now + nextDelay(schedule);
     if (verdict.retire) patch.status = verdict.retire === "expired" ? "fired" : verdict.retire;
     watches.update(w.id, patch);
     return { notified: false, reason: verdict.reason };
@@ -2807,7 +2850,7 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
   const fires = (w.lifecycle?.firesCount ?? 0) + 1;
   patch.lastNotifiedAt = now;
   patch.lifecycle = { ...w.lifecycle, firesCount: fires };
-  patch.nextCheckAt = now + jitter(schedule.everyMs ?? DAY);
+  patch.nextCheckAt = now + nextDelay(schedule);
   if (verdict.retire) patch.status = verdict.retire === "expired" ? "fired" : verdict.retire;
   watches.update(w.id, patch);
 
@@ -2871,7 +2914,7 @@ async function createWatchTurn(sender, request, mem) {
     return `I couldn't read that page just now, so I haven't started watching it. Try a different link?`;
   }
 
-  const patch = { state: obs, lastCheckedAt: Date.now(), nextCheckAt: Date.now() + jitter(created.schedule.everyMs) };
+  const patch = { state: obs, lastCheckedAt: Date.now(), nextCheckAt: Date.now() + nextDelay(created.schedule) };
   if (obs.neededBrowser) patch.source = { ...created.source, needsBrowser: true };
   // A relative condition needs something to be relative to.
   if ((created.condition.op === "drops_pct" || created.condition.op === "rises_pct") && obs.value != null) {

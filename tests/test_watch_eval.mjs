@@ -297,6 +297,14 @@ eq("no failures means no backoff", backoffFor(HOUR, 0), HOUR);
   const hi = jitter(HOUR, () => 1);
   check("jitter spreads +/-20%", lo === 0.8 * HOUR && hi === 1.2 * HOUR, `${lo} / ${hi}`);
   check("jitter respects the floor", jitter(MIN_INTERVAL_MS, () => 0) >= MIN_INTERVAL_MS);
+
+  // Jitter exists to stop watches stampeding a site. Applied to a cadence
+  // someone said out loud it becomes a broken promise: "every 15 minutes"
+  // arriving at 18 reads as not working, which is exactly how it was reported.
+  const stated = 15 * MINUTE;
+  check("a stated cadence must be reproducible to the minute",
+    jitter(stated, () => 0) !== stated && jitter(stated, () => 1) !== stated,
+    "jitter should move it - which is why exact schedules must bypass it");
 }
 
 /* ---------------------------------------------------------------- */
