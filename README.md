@@ -80,11 +80,15 @@ emits a `sourceIndex` integer and code maps it to a real URL from the fetched
 corpus, or to a retail URL that came from `search()` results. Anything out of
 range is dropped.
 
-**The agent cannot log in.** `detectBlock()` runs before every decision and
-before any action — deterministic regexes over URL, title and accessibility
-tree, no LLM to talk around. On a wall it screenshots the wall, stops, and falls
-back to public sources. The decide-loop schema has no field capable of
-expressing a credential, so no code path can type one.
+**The agent cannot log in by itself.** `detectBlock()` runs before every
+decision and before any action — deterministic regexes over URL, title and
+accessibility tree, no LLM to talk around. On a wall it screenshots the wall,
+stops, and falls back to public sources. The decide-loop schema has no field
+capable of expressing a credential, so nothing the model decides can type one.
+
+Signing in is a separate, user-initiated path — see **Signing in** below. That
+route is the only code in the process that ever handles a credential, it makes
+no model call, and the agent loop has no way to reach it.
 
 **No blind step lists.** The browser tier observes the live page, picks an index
 into the observed actions, and feeds prior step outcomes back in — so it cannot
@@ -97,6 +101,62 @@ demoted out of rank 1.
 
 **Artifacts are per-run.** `public/runs/<uuid>/<n>.png`, swept on a TTL.
 Concurrent requests can never see each other's screenshots.
+
+## Signing in
+
+When a task hits a login wall the agent offers a handover. There are two, and
+which one you get depends on whether the page has a fillable form.
+
+**One-time form (default).** You get a link to `/unlock/<token>` — a plain page
+served by this process with a real `<input type="password">`. You type into it,
+it POSTs to the server, the server types the value into the browser already
+parked on that login page via CDP `Input.insertText`, and the task resumes on
+its own. No reply needed.
+
+**Live view (fallback).** If no form is detected, or no public URL is
+configured, you get `debuggerFullscreenUrl` — a screencast of the remote
+browser. You drive it yourself and text back `done`.
+
+### Why the form exists
+
+The live view does not work on a phone. It renders as a single `<canvas>`, so
+tapping a field leaves `document.activeElement` as the canvas and no mobile
+keyboard opens. Verified by emulating an iPhone against a live view:
+
+```
+canvases: 1,  typeableElements: 1   (devtools' own UI)
+after tapping the password field:  activeTag "CANVAS", isTypeable false
+```
+
+Mobile emulation makes it worse, not better. An iPhone UA over a Linux TLS
+fingerprint gets the navigation blocked outright; `setDeviceMetricsOverride`
+with `mobile: true` makes Instagram serve an app-install interstitial with no
+form at all. A desktop UA at a 390×844 viewport renders the real fields, which
+is what ships.
+
+### What this costs, stated plainly
+
+The form means **the credential passes through this process.** That is a
+deliberate trade, not an oversight. What it buys, against the alternative of
+texting it:
+
+| | Texting it | The form |
+|---|---|---|
+| Apple iMessage infrastructure | sees it | no |
+| Linq servers, logs, message history | sees it, durably | no |
+| Permanent copy in Messages | yes | no |
+| This process | yes | yes |
+
+And it is handled by exactly one route, `POST /unlock/:token`, which makes **no
+model call**, writes **nothing to stdout**, stores **nothing in conversation
+memory**, and sends **nothing back out over Linq**. The value lives in one
+argument object for the duration of the call.
+
+The token is 32 random bytes, single-use, and expires in 10 minutes. It is spent
+before the fill runs, so a failed attempt burns it too and a retry gets a fresh
+one. `GET` renders the form without spending it, so reloading is safe. The
+endpoint is internet-facing by necessity — it has to open from a texted link —
+which makes the token the whole access control.
 
 ## Testing without iMessage
 
@@ -114,9 +174,28 @@ JSON, and **sends nothing over iMessage**.
 | Method | Path | |
 | --- | --- | --- |
 | `POST` | `/webhook/linq` | Signature-verified inbound webhook; acks in <1s |
+| `GET` | `/unlock/<token>` | One-time sign-in form. Public; the token is the access control |
+| `POST` | `/unlock/<token>` | Fills the credential into the parked browser, spends the token |
 | `POST` | `/debug/run` | Full pipeline as JSON, no message sent |
+| `POST` | `/debug/login` | Starts a real handoff, reports it, releases it |
+| `POST` | `/debug/unlock` | Mints a token against a real parked session, for tests |
 | `GET` | `/health` | Config, models, active sessions, queue depth |
 | `GET` | `/runs/<uuid>/<n>.png` | Run screenshots |
+
+### Tests
+
+```bash
+node tests/test_redaction.mjs      # 28, no server needed
+node tests/test_routing.mjs        # 21, server running
+node tests/test_login_handoff.mjs  #  5, costs one Browserbase session
+node tests/test_unlock.mjs         # 13, costs two; uses a public test login
+```
+
+`test_unlock.mjs` drives `the-internet.herokuapp.com/login`, whose credentials
+are published, so no real secret is ever typed. It asserts both directions —
+that correct credentials sign in, which is what separates "the fill works" from
+"the fill silently did nothing", and that wrong ones are reported rather than
+swallowed.
 
 ## Notes
 

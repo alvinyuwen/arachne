@@ -1757,6 +1757,153 @@ function cdpConnect(wsUrl, { timeoutMs = 20000 } = {}) {
 }
 
 /**
+ * Attach to a session's existing page target and hand the caller a driver.
+ *
+ * Every CDP user here wants the same three things - connect, find the one page,
+ * attach flat - and wants the socket closed afterwards whatever happens. The
+ * page target is reused rather than created because the live view link points
+ * at a specific tab; opening a second one would leave the user watching the
+ * wrong half of the browser.
+ */
+async function withCdpPage(sessionId, fn) {
+  const debug = await bb.sessions.debug(sessionId);
+  const cdp = cdpConnect(debug.wsUrl);
+  await cdp.ready;
+  try {
+    const { targetInfos } = await cdp.send("Target.getTargets");
+    const target = targetInfos.find((t) => t.type === "page");
+    if (!target) throw new Error("session has no page target");
+    const attached = await cdp.send("Target.attachToTarget", {
+      targetId: target.targetId,
+      flatten: true,
+    });
+    const sid = attached.sessionId;
+    await cdp.send("Page.enable", {}, sid);
+    await cdp.send("Runtime.enable", {}, sid);
+    return await fn({
+      send: (method, params) => cdp.send(method, params, sid),
+      evaluate: async (expression) => {
+        const r = await cdp.send(
+          "Runtime.evaluate",
+          { expression, returnByValue: true, awaitPromise: true },
+          sid,
+        );
+        return r.result?.value;
+      },
+    });
+  } finally {
+    cdp.close();
+  }
+}
+
+/**
+ * Locate a sign-in form without knowing the site.
+ *
+ * Runs in the page and returns a plain description, never any value. Anchoring
+ * on input[type=password] rather than on field names is what makes this work
+ * across sites: Instagram's own form names its fields username/password, but
+ * the page actually served under a datacentre IP named them email/pass, and a
+ * hardcoded selector would have silently matched neither.
+ */
+const FIND_LOGIN_FIELDS = `(() => {
+  const visible = (el) => {
+    const b = el.getBoundingClientRect();
+    return b.width > 20 && b.height > 10;
+  };
+  const pass = [...document.querySelectorAll('input[type=password]')].find(
+    (i) => visible(i) && !i.disabled,
+  );
+  if (!pass) return JSON.stringify({ found: false, reason: 'no password field on this page' });
+
+  // The identifier field is the nearest visible text-ish input before it.
+  const all = [...document.querySelectorAll('input')];
+  const before = all.slice(0, all.indexOf(pass)).reverse();
+  const user = before.find(
+    (i) => visible(i) && !i.disabled && ['text', 'email', 'tel', ''].includes(i.type),
+  );
+
+  const form = pass.form;
+  const submit = form
+    ? form.querySelector('button[type=submit], input[type=submit]') ||
+      [...form.querySelectorAll('button')].find(visible)
+    : null;
+
+  return JSON.stringify({
+    found: true,
+    hasUser: Boolean(user),
+    userLabel: user ? (user.name || user.type || 'text') : null,
+    passLabel: pass.name || 'password',
+    hasSubmit: Boolean(submit),
+  });
+})()`;
+
+/**
+ * Type a credential into the remote page and submit it.
+ *
+ * Input.insertText rather than assigning .value: the value setter bypasses the
+ * browser's input pipeline, and React - which Instagram and most of the web
+ * use - tracks its own state and reverts anything it did not observe an input
+ * event for. insertText goes through the real pipeline, so the page reacts as
+ * though a person typed.
+ *
+ * Nothing in here logs, stores, or returns the credential. It lives in the
+ * argument object for the duration of this call and nowhere else.
+ */
+async function fillCredentials(sessionId, { username, password }) {
+  return withCdpPage(sessionId, async (page) => {
+    const found = JSON.parse((await page.evaluate(FIND_LOGIN_FIELDS)) ?? "{}");
+    if (!found.found) return { ok: false, reason: found.reason ?? "no sign-in form found" };
+
+    if (username && found.hasUser) {
+      await page.evaluate(`(() => {
+        const p = document.querySelector('input[type=password]');
+        const all = [...document.querySelectorAll('input')];
+        const u = all.slice(0, all.indexOf(p)).reverse()
+          .find(i => !i.disabled && ['text','email','tel',''].includes(i.type));
+        if (u) { u.focus(); u.select && u.select(); }
+      })()`);
+      await page.send("Input.insertText", { text: username });
+    }
+
+    await page.evaluate(`document.querySelector('input[type=password]').focus()`);
+    await page.send("Input.insertText", { text: password });
+
+    // requestSubmit runs validation and fires the submit handler the same way a
+    // click does; a bare form.submit() skips both and some sites ignore it.
+    await page.evaluate(`(() => {
+      const p = document.querySelector('input[type=password]');
+      const f = p && p.form;
+      const b = f && (f.querySelector('button[type=submit], input[type=submit]'));
+      if (b) { b.click(); return; }
+      if (f && f.requestSubmit) { f.requestSubmit(); return; }
+      if (f) f.submit();
+    })()`);
+
+    // Give the navigation a chance, then report what the page became. This is
+    // the only signal available for whether the credential worked.
+    await new Promise((r) => setTimeout(r, 6000));
+    const after = JSON.parse(
+      (await page.evaluate(`JSON.stringify({
+        url: location.href,
+        stillHasPassword: Boolean(document.querySelector('input[type=password]')),
+        text: (document.body.innerText || '').slice(0, 400)
+      })`)) ?? "{}",
+    );
+    const block = blockFromText({ url: after.url ?? "", body: after.text ?? "" });
+    const signedIn = !after.stillHasPassword && !block.blocked;
+    return {
+      ok: signedIn,
+      url: after.url ?? null,
+      reason: signedIn
+        ? null
+        : after.stillHasPassword
+          ? "the sign-in page is still showing - the details may be wrong, or it wants a code"
+          : `still gated (${block.kind ?? "unknown"})`,
+    };
+  });
+}
+
+/**
  * The live view is opened on a phone, so the browser behind it is phone-shaped.
  *
  * Browserbase defaults to a desktop window, which the DevTools live view then
@@ -1802,27 +1949,18 @@ async function startLoginSession(sender, url) {
 
   const sessionId = browser.sessionId;
   let parked = false;
+  let hasForm = false;
   try {
-    const debug = await bb.sessions.debug(sessionId);
-    const cdp = cdpConnect(debug.wsUrl);
-    await cdp.ready;
-    try {
-      const { targetInfos } = await cdp.send("Target.getTargets");
-      const target = targetInfos.find((t) => t.type === "page");
-      if (!target) throw new Error("session has no page target");
-      // Navigate the tab that already exists rather than opening a second one,
-      // so the live view link and the signed-in page are the same tab.
-      const attached = await cdp.send("Target.attachToTarget", {
-        targetId: target.targetId,
-        flatten: true,
-      });
-      await cdp.send("Page.enable", {}, attached.sessionId);
-      await cdp.send("Page.navigate", { url }, attached.sessionId);
+    await withCdpPage(sessionId, async (page) => {
+      await page.send("Page.navigate", { url });
       parked = true;
       console.log(`[login] parked on ${url}`);
-    } finally {
-      cdp.close();
-    }
+      // Whether a sign-in form is actually present decides which path the user
+      // is offered: the one-time form only works if there is something to fill.
+      await new Promise((r) => setTimeout(r, 5000));
+      const found = JSON.parse((await page.evaluate(FIND_LOGIN_FIELDS)) ?? "{}");
+      hasForm = Boolean(found.found);
+    });
   } catch (err) {
     // Not fatal, but it is the difference between "sign in here" and "go find
     // the site yourself", so the caller is told and says so.
@@ -1837,6 +1975,7 @@ async function startLoginSession(sender, url) {
     contextId,
     sessionId,
     parked,
+    hasForm,
     liveUrl:
       page?.debuggerFullscreenUrl ||
       live.debuggerFullscreenUrl ||
@@ -1865,6 +2004,143 @@ async function finishLoginSession(sessionId) {
 
 const LOGIN_CONFIRM_RE = /\b(done|finished|ok(ay)?|logged? ?in|signed? ?in|ready|yes|yep|complete)\b/i;
 const LOGIN_REQUEST_RE = /\b(log ?in|login|sign ?in|authenticate|connect (my )?account)\b/i;
+
+/* ------------------------------------------------------------------ */
+/* One-time sign-in form                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A single-use page where the user types a credential into a real form.
+ *
+ * The live view cannot take a password on a phone: it is one <canvas>, so a tap
+ * leaves document.activeElement as the canvas and no mobile keyboard opens.
+ * Measured, not assumed. A real <input> on a page this server controls fixes
+ * that - the keyboard opens, and a password manager can fill it.
+ *
+ * The tradeoff is explicit and was chosen deliberately: the credential now
+ * passes through this process. What it does NOT do is pass through Apple and
+ * Linq, or sit in a message history on two devices, which is what texting it
+ * would mean. And it is handled by exactly one route, which never logs it,
+ * never stores it, and never puts it in a model prompt.
+ *
+ * The token is the only thing standing in front of an internet-facing form, so
+ * it is 32 random bytes, single-use, short-lived, and bound to one session.
+ */
+const pendingUnlock = new Map();
+const UNLOCK_TTL_MS = 10 * 60 * 1000;
+
+function mintUnlockToken(entry) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  pendingUnlock.set(token, { ...entry, at: Date.now() });
+  return token;
+}
+
+/** Read without spending: GET renders the form, only POST consumes the token. */
+function readUnlockToken(token) {
+  const entry = pendingUnlock.get(token);
+  if (!entry) return null;
+  if (Date.now() - entry.at > UNLOCK_TTL_MS) {
+    pendingUnlock.delete(token);
+    return null;
+  }
+  return entry;
+}
+
+function sweepUnlockTokens() {
+  const now = Date.now();
+  for (const [token, entry] of pendingUnlock) {
+    if (now - entry.at > UNLOCK_TTL_MS) pendingUnlock.delete(token);
+  }
+}
+
+/**
+ * The form itself.
+ *
+ * Deliberately one self-contained page with no external requests: no fonts, no
+ * analytics, no CDN. A page that collects a password should not be asking third
+ * parties for anything while it does it.
+ *
+ * autocomplete="current-password" and a matching username field are what let
+ * iOS Keychain and 1Password offer to fill it, which is most of the point.
+ */
+function unlockPage({ host, token, error = "" }) {
+  const safeHost = String(host).replace(/[<>&"]/g, "");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Sign in to ${safeHost}</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#d8d8d8; --accent:#1b6ef3; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14151a; --fg:#f2f2f4; --mut:#9a9aa3; --line:#33343c; --accent:#5b9bff; --bad:#ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100svh; padding:24px 16px; }
+  .card { width:100%; max-width:360px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { margin:0 0 20px; color:var(--mut); font-size:14px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:14px 0 6px; }
+  input { width:100%; padding:13px 12px; font-size:17px; border:1px solid var(--line); border-radius:10px;
+          background:var(--bg); color:var(--fg); }
+  input:focus { outline:2px solid var(--accent); outline-offset:1px; border-color:transparent; }
+  button { width:100%; margin-top:20px; padding:14px; font-size:16px; font-weight:600; border:0; border-radius:10px;
+           background:var(--accent); color:#fff; }
+  button[disabled] { opacity:.55; }
+  .err { margin-top:14px; padding:10px 12px; border-radius:8px; border:1px solid var(--bad); color:var(--bad); font-size:14px; }
+  .note { margin-top:20px; color:var(--mut); font-size:12.5px; }
+  .ok { text-align:center; padding:28px 0; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <h1>Sign in to ${safeHost}</h1>
+  <p class="sub">This goes straight into the browser already waiting on that page. Used once, then discarded.</p>
+  <form id="f" autocomplete="on">
+    <input type="hidden" name="host" value="${safeHost}">
+    <label for="u">Username or email</label>
+    <input id="u" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit" id="b">Sign in</button>
+  </form>
+  ${error ? `<div class="err">${String(error).replace(/[<>&]/g, "")}</div>` : ""}
+  <p class="note">This link works once and expires in 10 minutes. Nothing typed here is logged or stored.</p>
+</div>
+<script>
+  const f = document.getElementById('f'), b = document.getElementById('b');
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    b.disabled = true; b.textContent = 'Signing in\\u2026';
+    let out;
+    try {
+      const r = await fetch(location.pathname, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: f.username.value, password: f.password.value }),
+      });
+      out = await r.json();
+    } catch (err) {
+      out = { ok: false, reason: 'could not reach the server' };
+    }
+    f.reset();
+    if (out.ok) {
+      document.getElementById('card').innerHTML =
+        '<div class="ok"><h1>You\\u2019re in</h1><p class="sub">Go back to Messages \\u2014 the task is running now.</p></div>';
+    } else {
+      b.disabled = false; b.textContent = 'Try again';
+      const d = document.createElement('div');
+      d.className = 'err'; d.textContent = out.reason || 'That did not work.';
+      document.getElementById('card').appendChild(d);
+    }
+  });
+</script>
+</body>
+</html>`;
+}
 
 /* ------------------------------------------------------------------ */
 /* Browser tier                                                        */
@@ -2379,27 +2655,56 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
       return;
     }
     mem.pendingLogin = { ...login, ...handoff, stage: "waiting", at: Date.now() };
-    const note =
-      (handoff.parked
-        ? `Open this - it's a browser running on my side, already on the ${login.host} sign-in page. `
-        : `Open this and go to ${login.host} - it's a browser running on my side. `) +
-      `Your password goes straight to ${login.host} and never through me:
+
+    // Prefer the one-time form. It is the only path that works on a phone - the
+    // live view is a canvas, so no mobile keyboard opens over it - and it needs
+    // a form on the page to fill, plus a public URL to serve itself from.
+    const base = await resolvePublicBaseUrl();
+    const useForm = handoff.hasForm && Boolean(base);
+    let note;
+
+    if (useForm) {
+      const token = mintUnlockToken({
+        sender: senderNumber,
+        sessionId: handoff.sessionId,
+        contextId: handoff.contextId,
+        host: login.host,
+        request: login.request,
+      });
+      note =
+        `${login.host} needs a sign-in. Open this and enter it there:
+
+${base}/unlock/${token}
+
+` +
+        `It goes straight into the browser I already have waiting on that page, ` +
+        `and I'll carry on as soon as it goes through - no need to text me back. ` +
+        `The link works once and expires in 10 minutes.`;
+    } else {
+      note =
+        (handoff.parked
+          ? `Open this - it's a browser running on my side, already on the ${login.host} sign-in page. `
+          : `Open this and go to ${login.host} - it's a browser running on my side. `) +
+        `Your password goes straight to ${login.host} and never through me:
 
 ${handoff.liveUrl}
 
 ` +
-      // The live view is a screencast of a remote screen, so a phone keyboard
-      // does not always open when you tap a field - there is no real input on
-      // your device to focus. Better to say so than let them fight it: the
-      // session stays up for 30 minutes and the link works from any device.
-      `If your keyboard won't come up when you tap a field, open the same link on a ` +
-      `laptop - it's a remote screen, so phones don't always offer the keyboard. ` +
-      `You've got 30 minutes.
+        // The live view is a screencast of a remote screen, so a phone keyboard
+        // does not always open when you tap a field - there is no real input on
+        // your device to focus. Better to say so than let them fight it: the
+        // session stays up for 30 minutes and the link works from any device.
+        `If your keyboard won't come up when you tap a field, open the same link on a ` +
+        `laptop - it's a remote screen, so phones don't always offer the keyboard. ` +
+        `You've got 30 minutes.
 
 Text me "done" when you're in and I'll pick the task back up. ` +
-      `Don't share that link - anyone with it can drive that browser.`;
-    // The live view URL is deliberately not stored in history: it is a bearer
-    // handle to a running browser, and history goes into later prompts.
+        `Don't share that link - anyone with it can drive that browser.`;
+    }
+
+    // Neither URL is stored in history: the unlock token is single-use access to
+    // a form, the live view is a bearer handle to a running browser, and history
+    // goes into later prompts.
     recordTurn(senderNumber, "assistant", `(sent a sign-in link for ${login.host})`, "task");
     await send(senderNumber, [{ type: "text", value: note }]);
     return;
@@ -2649,6 +2954,126 @@ app.post("/debug/turn", async (req, res) => {
 });
 
 /**
+ * Mint an unlock token against a real parked session, for testing.
+ *
+ * Returns the token so a test can drive GET and POST exactly as a phone would,
+ * without needing an inbound message to get there. The session is left running
+ * on purpose: the point is to then POST a credential into it.
+ */
+app.post("/debug/unlock", async (req, res) => {
+  if (!DEBUG_TOKEN || req.get("x-debug-token") !== DEBUG_TOKEN) {
+    return res.status(404).json({ error: "not found" });
+  }
+  const from = String(req.body?.from ?? "+15550000000");
+  const url = String(req.body?.url ?? "https://www.instagram.com/accounts/login/");
+  try {
+    const handoff = await startLoginSession(from, url);
+    const token = mintUnlockToken({
+      sender: from,
+      sessionId: handoff.sessionId,
+      contextId: handoff.contextId,
+      host: hostOf(url),
+      request: String(req.body?.request ?? "(test)"),
+    });
+    res.json({
+      token,
+      path: `/unlock/${token}`,
+      parked: handoff.parked,
+      hasForm: handoff.hasForm,
+      sessionId: handoff.sessionId,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * The one-time sign-in form.
+ *
+ * Public by necessity - it has to open on a phone from a texted link - so the
+ * token is the whole access control: 32 random bytes, one use, ten minutes.
+ * An unknown or spent token gets a flat 404 with no hint that it ever existed.
+ */
+app.get("/unlock/:token", (req, res) => {
+  const entry = readUnlockToken(req.params.token);
+  if (!entry) return res.status(404).type("html").send("<h1>This link has expired</h1>");
+  res.set("Cache-Control", "no-store");
+  res.set("Referrer-Policy", "no-referrer");
+  res.type("html").send(unlockPage({ host: entry.host, token: req.params.token }));
+});
+
+/**
+ * Receive the credential, type it into the waiting browser, discard it.
+ *
+ * Everything about this handler is deliberate: it does not log the body, does
+ * not record a conversation turn containing it, does not call a model, and
+ * spends the token before doing any work so a replay cannot reuse it. The
+ * variable goes out of scope when the handler returns.
+ */
+app.post("/unlock/:token", async (req, res) => {
+  const token = req.params.token;
+  const entry = readUnlockToken(token);
+  if (!entry) return res.status(404).json({ ok: false, reason: "this link has expired" });
+  // Spend it first. A retry gets a fresh link rather than a second shot at this
+  // one, which is what makes "single use" true even if the fill throws.
+  pendingUnlock.delete(token);
+
+  const username = String(req.body?.username ?? "");
+  const password = String(req.body?.password ?? "");
+  if (!password) return res.status(400).json({ ok: false, reason: "no password given" });
+
+  let outcome;
+  try {
+    outcome = await fillCredentials(entry.sessionId, { username, password });
+  } catch (err) {
+    console.warn(`[unlock] fill failed: ${err.message}`);
+    return res.status(500).json({ ok: false, reason: "could not reach the browser session" });
+  }
+
+  if (!outcome.ok) {
+    // Hand back a fresh token so they can try again without texting first.
+    const retry = mintUnlockToken({ ...entry });
+    console.warn(`[unlock] ${entry.host} not signed in: ${outcome.reason}`);
+    return res.json({ ok: false, reason: outcome.reason, retryPath: `/unlock/${retry}` });
+  }
+
+  console.log(`[unlock] ${entry.host} signed in for ${entry.sender}`);
+  res.json({ ok: true });
+
+  // Bank the cookies and pick the task back up, after responding - the phone
+  // should not sit on a spinner for the length of a browser run.
+  finishLoginSession(entry.sessionId)
+    .then(() => resumeAfterLogin(entry))
+    .catch((err) => console.warn(`[unlock] resume failed: ${err.message}`));
+});
+
+/**
+ * Carry on with whatever the user originally asked for, now signed in.
+ *
+ * Runs through the same per-sender queue as an inbound message so it cannot
+ * interleave with one, and records the result in memory the same way a normal
+ * task does - from here on there is nothing special about this turn.
+ */
+async function resumeAfterLogin(entry) {
+  const mem = conversations.get(entry.sender);
+  if (mem?.pendingLogin) mem.pendingLogin = null;
+  // Signing in is sometimes the whole point - "connect my instagram" with
+  // nothing to do afterwards. Running an empty request would spend a session
+  // and text back about nothing.
+  if (!entry.request?.trim()) return;
+  return enqueueForSender(entry.sender, async () => {
+    const result = await handleRequest(entry.sender, entry.request, {
+      conversation: mem ?? undefined,
+      contextId: entry.contextId,
+    });
+    if (result) {
+      recordTaskResult(entry.sender, result);
+      recordTurn(entry.sender, "assistant", result.text, "task");
+    }
+  });
+}
+
+/**
  * Start a real login handoff, report what the user would be handed, release it.
  *
  * This exists because the parking failure was invisible: it was caught, logged
@@ -2762,6 +3187,7 @@ await fs.mkdir(ARTIFACT_DIR, { recursive: true });
 setInterval(() => {
   sweepArtifacts();
   sweepSenders();
+  sweepUnlockTokens();
 }, 600000).unref();
 sweepArtifacts();
 
