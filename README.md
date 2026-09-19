@@ -29,11 +29,16 @@ scheduler (every 60s) ─▶ due watches ─▶ observe ─▶ evaluate ─▶ L
 
 ## Watches
 
-Four kinds cover every case, because they differ in what gets **compared**, not
+Five kinds cover every case, because they differ in what gets **compared**, not
 in subject. A share price and a keyboard price are the same problem.
+
+The first question is whether there is a condition at all. "Text me the weather
+every hour" has none — the schedule *is* the request. Those are digests, and
+without that kind they became numeric watches with an invented threshold.
 
 | Kind | Compares | Covers |
 | --- | --- | --- |
+| `digest` | nothing — the schedule is the trigger | the weather, headlines, "the price every 15 min" |
 | `numeric` | a number + unit | price, stocks, spots left, follower count |
 | `state` | a label transition | in stock, applications open, announced |
 | `presence` | did it appear | sale badges, a name on a list |
@@ -42,7 +47,7 @@ in subject. A share price and a keyboard price are the same problem.
 `metric` is free text (`"NVDA share price"`, `"spots remaining"`), so `numeric`
 is not a shopping feature.
 
-**Conditions.** `lt lte gt gte eq neq changes drops_pct rises_pct` for numbers,
+**Conditions.** `always changes` for digests, `lt lte gt gte eq neq changes drops_pct rises_pct` for numbers,
 `becomes changes` for states, `appears disappears` for presence, `within_days`
 for deadlines. `drops_pct` is what "on sale" means when no number is given — a
 relative move against a stored baseline.

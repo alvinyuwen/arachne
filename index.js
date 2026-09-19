@@ -954,9 +954,12 @@ LATEST MESSAGE: ${text}`,
  */
 const WatchSchema = z.object({
   kind: z
-    .enum(["numeric", "state", "presence", "deadline"])
+    .enum(["numeric", "state", "presence", "deadline", "digest"])
     .describe(
-      "numeric: a number to compare (price, share price, spots left). " +
+      "digest: they just want to be TOLD something on a schedule, with no condition - " +
+        "the weather, today's headlines, the current price. If there is no threshold and " +
+        "no event to wait for, it is a digest. " +
+        "numeric: a number to compare against a threshold (under $80, above 5%). " +
         "state: one of a few labels (in stock / out of stock, open / closed). " +
         "presence: whether something shows up at all (a sale badge, a name on a list). " +
         "deadline: a date on the page, where the trigger is the clock running down.",
@@ -973,9 +976,12 @@ const WatchSchema = z.object({
   op: z
     .enum([
       "lt", "lte", "gt", "gte", "eq", "neq", "changes",
-      "drops_pct", "rises_pct", "becomes", "appears", "disappears", "within_days",
+      "drops_pct", "rises_pct", "becomes", "appears", "disappears", "within_days", "always",
     ])
-    .describe("The comparison. Use drops_pct for 'on sale' or 'a deal' with no fixed number."),
+    .describe(
+      "The comparison. Use `always` for a digest with no condition, drops_pct for " +
+        "'on sale' or 'a deal' with no fixed number.",
+    ),
   value: z.number().nullable().describe("Threshold for lt/lte/gt/gte/eq/neq. Else null."),
   pct: z.number().nullable().describe("Percentage for drops_pct/rises_pct. Else null."),
   target: z.string().nullable().describe('Target label for `becomes`, e.g. "in_stock", "open". Else null.'),
@@ -1001,10 +1007,15 @@ const WatchSchema = z.object({
 const WATCH_SYSTEM = `You turn one request into a monitoring job for an SMS assistant.
 
 Pick the kind by what has to be COMPARED, not by the subject:
+- nothing - they just want telling -> digest  (op "always", fireMode "recurring")
 - a number that moves            -> numeric
 - one of a few labels            -> state   (target like "in_stock", "open", "available")
 - whether something is there     -> presence
 - a date on the page counting down -> deadline
+
+Ask first: is there a condition at all? "text me the weather every hour", "send me the
+headlines each morning", "the AMZN price every 15 minutes" have none - the schedule is the
+whole request, so they are digests. "tell me IF it drops below $80" has one.
 
 "on sale", "a deal", "cheaper" with no number means drops_pct, usually 15-20.
 "back in stock" is state/becomes with target "in_stock".
@@ -1610,6 +1621,18 @@ const OBSERVE_SCHEMAS = {
         .describe(`The ${metric} date as written on the page, e.g. "October 4, 2025" or "Oct 4". Null if not shown.`),
       title: z.string().nullable().describe("What this page is about, a few words"),
     }),
+  digest: (metric) =>
+    z.object({
+      summary: z
+        .string()
+        .nullable()
+        .describe(
+          `The current ${metric}, stated in one or two short lines as you would text it to someone. ` +
+            "Concrete values, not description: \"18C, cloudy, rain after 4pm\" rather than \"the weather is shown\". " +
+            "Null if the page does not have it.",
+        ),
+      title: z.string().nullable().describe("What this page is about, a few words"),
+    }),
 };
 
 /**
@@ -1678,6 +1701,9 @@ function shapeObservation(watch, d, url) {
   if (watch.kind === "presence") {
     return { url, at, present: Boolean(d.found), evidence: d.evidence ?? null };
   }
+  if (watch.kind === "digest") {
+    return { url, at, summary: d.summary ? clamp(stripMarkdownSoft(d.summary), 300) : null, title: d.title ?? null };
+  }
   return { url, at, deadlineAt: parseDateish(d.dateText), raw: d.dateText ?? null, title: d.title ?? null };
 }
 
@@ -1686,6 +1712,7 @@ function observationIsEmpty(watch, obs) {
   if (watch.kind === "numeric") return obs.value == null && !obs.raw;
   if (watch.kind === "state") return obs.state === "unknown" && !obs.raw;
   if (watch.kind === "deadline") return obs.deadlineAt == null && !obs.raw;
+  if (watch.kind === "digest") return !obs.summary;
   return obs.present !== true && !obs.evidence;
 }
 
@@ -1793,6 +1820,7 @@ async function observeWatch(watch, deadline) {
   }
   if (watch.kind === "presence") return seen.find((o) => o.present) ?? seen[0];
   if (watch.kind === "state") return seen.find((o) => o.state !== "unknown") ?? seen[0];
+  if (watch.kind === "digest") return seen.find((o) => o.summary) ?? seen[0];
   return seen.find((o) => o.deadlineAt != null) ?? seen[0];
 }
 
@@ -2548,8 +2576,16 @@ function watchFromSpec(sender, spec, mem) {
     schedule: {
       everyMs,
       // A share price only moves while a market is open, so overnight checks
-      // are spend for nothing. Everything else is checked around the clock.
-      activeWindow: /share|stock|ticker|index/i.test(spec.metric ?? "") ? { from: 13, to: 21 } : null,
+      // for a THRESHOLD are spend for nothing.
+      //
+      // Not applied to digests. Someone who says "the price every 15 minutes"
+      // has chosen the cadence, and silently skipping two thirds of the day
+      // means they get nothing and are told nothing about why - which is what
+      // happened to the first person who asked for exactly that at 6pm.
+      activeWindow:
+        spec.kind !== "digest" && /share|stock|ticker|index/i.test(spec.metric ?? "")
+          ? { from: 13, to: 21 }
+          : null,
       quietHours: { from: 22, to: 7 },
     },
     lifecycle: {
@@ -2570,6 +2606,8 @@ function watchFromSpec(sender, spec, mem) {
  */
 function defaultIntervalFor(spec) {
   if (spec.kind === "deadline") return DAY;
+  // A digest with no stated cadence is a daily briefing, not a 6-hourly one.
+  if (spec.kind === "digest") return DAY;
   if (!spec.urls?.length && spec.searchQuery) return 12 * HOUR;
   return Number(WATCH_DEFAULT_INTERVAL_MS) || DEFAULT_INTERVAL_MS;
 }
@@ -2602,6 +2640,14 @@ function watchLine(w) {
 
 /** The alert itself. Short, because it arrives on a phone with no context. */
 function notificationText(w, obs, reason) {
+  // A digest is the thing itself, not an alert about a thing. "Update: weather
+  // / the weather is 18C, cloudy" reads like a machine; the summary alone reads
+  // like a person answering.
+  if (w.kind === "digest") {
+    const lines = [`${w.label}: ${reason}`];
+    if (obs?.url) lines.push("", obs.url);
+    return lines.join("\n");
+  }
   const head =
     w.kind === "numeric" && /drops|lt|lte/.test(w.condition.op) ? "Price drop"
     : w.kind === "state" ? "Status change"
@@ -2713,10 +2759,16 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
   ]);
   if (!delivered) {
     // Nobody is waiting on this path, so a failed send must not be recorded as
-    // a notification - retry on the next tick instead of losing the alert.
-    patch.nextCheckAt = now + Math.min(schedule.everyMs ?? HOUR, 15 * 60000);
+    // a notification - retry rather than lose the alert. But retrying forever
+    // is its own bug: a permanently undeliverable recipient (Linq 403
+    // "Recipient not allowed") would re-fetch the page every tick for ever.
+    // Count it like a fetch failure so it backs off and eventually pauses.
+    const fails = (w.failCount ?? 0) + 1;
+    patch.failCount = fails;
+    patch.nextCheckAt = now + backoffFor(Math.min(schedule.everyMs ?? HOUR, 15 * 60000), fails);
+    if (fails >= Number(WATCH_MAX_FAILS)) patch.status = "paused";
     watches.update(w.id, patch);
-    console.warn(`[watch ${w.id}] alert not delivered; will retry`);
+    console.warn(`[watch ${w.id}] alert not delivered (attempt ${fails}); will retry`);
     return { notified: false, reason: "send failed" };
   }
 
@@ -2826,6 +2878,11 @@ async function createWatchTurn(sender, request, mem) {
   }
 
   const c = created.condition;
+  if (created.kind === "digest") {
+    // A digest summary is already a sentence and usually ends in a full stop;
+    // appending another gives "0% chance of rain..".
+    return `Got it - I'll text you ${created.label} ${fmtEvery(created.schedule.everyMs)}${until}.${now ? `\n\nRight now: ${now.replace(/\.$/, "")}.` : ""}`;
+  }
   const cond =
     c.op === "drops_pct" ? `drops ${c.pct}%`
     : c.op === "becomes" ? `it's ${String(c.target).replace(/_/g, " ")}`
@@ -2893,7 +2950,12 @@ async function manageWatchTurn(sender, request, mem, send) {
     return `Updated - ${watchLine(watches.update(target.id, patch))}`;
   }
   if (m.action === "check_now") {
-    const out = await checkWatch({ ...target, lastNotifiedAt: null }, { send });
+    // Forcing a check means checking, so the active window does not apply -
+    // otherwise "check it now" after hours returns silence with no explanation.
+    const out = await checkWatch(
+      { ...target, lastNotifiedAt: null, schedule: { ...target.schedule, activeWindow: null } },
+      { send },
+    );
     if (out.notified) return null; // checkWatch already texted them
     if (out.failed) return `I couldn't read that page just now. I'll keep trying on schedule.`;
     const fresh = watches.get(target.id);

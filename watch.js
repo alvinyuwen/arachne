@@ -27,13 +27,19 @@
  * price are the same problem; "applications open" and "back in stock" are the
  * same problem.
  */
-export const KINDS = ["numeric", "state", "presence", "deadline"];
+export const KINDS = ["numeric", "state", "presence", "deadline", "digest"];
 
 export const OPS_BY_KIND = {
   numeric: ["lt", "lte", "gt", "gte", "eq", "neq", "changes", "drops_pct", "rises_pct"],
   state: ["becomes", "changes"],
   presence: ["appears", "disappears"],
   deadline: ["within_days"],
+  // "text me the weather every hour" has no condition at all - the schedule IS
+  // the trigger. Every other kind answers "has it crossed a line yet"; this one
+  // answers "what does it say right now", which is a whole class of request
+  // ("the weather", "today's headlines", "the front page") that the threshold
+  // kinds cannot express.
+  digest: ["always", "changes"],
 };
 
 export const MINUTE = 60_000;
@@ -300,6 +306,16 @@ function satisfied(kind, condition, obs, prev, now) {
     return daysLeft <= condition.leadDays && daysLeft >= 0;
   }
 
+  if (kind === "digest") {
+    const s = obs?.summary;
+    if (!s) return null;
+    if (op === "changes") {
+      const p = prev?.summary ?? null;
+      return p == null ? false : s.trim() !== p.trim();
+    }
+    return true; // "always": the schedule is the trigger
+  }
+
   return false;
 }
 
@@ -334,7 +350,11 @@ export function evaluate(watch, prev, obs, now = Date.now()) {
       notify: true,
       satisfied: true,
       retire: done ? "max_fires" : null,
-      reason: "scheduled update",
+      // The reading IS the message for a scheduled update. A fixed "scheduled
+      // update" string sent a weather digest that said nothing about the
+      // weather - the whole content of the text was the fact that a text had
+      // been scheduled.
+      reason: describe(watch, obs) || "I couldn't read it this time",
       nextBaseline: obs ?? prev ?? null,
     };
   }
@@ -419,5 +439,7 @@ export function describe(watch, obs) {
     const days = Math.max(0, Math.round((obs.deadlineAt - Date.now()) / DAY));
     return days === 0 ? `${what} closes today` : `${what} closes in ${days} day${days === 1 ? "" : "s"}`;
   }
+  // A digest IS its summary - there is no threshold to restate.
+  if (kind === "digest") return obs?.summary ? String(obs.summary) : "";
   return "something changed";
 }

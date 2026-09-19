@@ -238,6 +238,37 @@ eq("a recurring watch respects maxFires",
   "max_fires");
 
 /* ---------------------------------------------------------------- */
+console.log("\nevaluate: digest - 'text me the weather every hour'\n");
+//
+// The kind with no condition at all. Every other kind answers "has it crossed a
+// line"; this answers "what does it say now", which is what a weather or
+// headlines request actually is. Without it those became numeric watches with
+// an invented threshold.
+
+const weather = { kind: "digest", metric: "the weather",
+  condition: { op: "always" }, lifecycle: { fireMode: "recurring", firesCount: 0 } };
+const sum = (t) => ({ summary: t });
+
+check("a digest fires on schedule with no condition",
+  evaluate(weather, sum("18C cloudy"), sum("18C cloudy")).notify === true);
+check("a digest fires even when the text is identical",
+  evaluate(weather, sum("18C cloudy"), sum("18C cloudy")).notify === true);
+check("a digest still fires when the page could not be read",
+  evaluate(weather, sum("18C cloudy"), null).notify === true);
+
+// The other digest mode: only when it actually changes.
+const headline = { kind: "digest", metric: "the top headline",
+  condition: { op: "changes" }, lifecycle: { fireMode: "every_change", firesCount: 0 } };
+check("a changes-digest fires when the text moves",
+  evaluate(headline, sum("Market opens flat"), sum("Market closes up 2%")).notify === true);
+check("a changes-digest is silent when it does not",
+  evaluate(headline, sum("Market opens flat"), sum("Market opens flat")).notify === false);
+check("whitespace alone is not a change",
+  evaluate(headline, sum("Market opens flat"), sum("  Market opens flat  ")).notify === false);
+check("an unreadable digest is not a change",
+  evaluate(headline, sum("Market opens flat"), sum(null)).unreadable === true);
+
+/* ---------------------------------------------------------------- */
 console.log("\nschedule: windows, quiet hours, jitter, backoff\n");
 
 const atHour = (h) => Date.UTC(2024, 0, 1, h, 0, 0);
