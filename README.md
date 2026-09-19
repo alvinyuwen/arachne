@@ -1,28 +1,38 @@
 # linq-browser-agent
 
-Turns incoming **Linq iMessage** requests into real web interactions on a remote
-**Browserbase** browser, driven by **Stagehand** + **OpenAI**, and messages the
-result — a summary plus a screenshot — back to the sender.
+Turns incoming **Linq iMessage** requests into real web research, and texts back
+a structured answer with working links and a screenshot.
 
 ```
 iMessage ──▶ Linq webhook ──▶ POST /webhook/linq
-                                   │
-                                   ├─▶ "On it! Launching browser automation..."
-                                   │
-                                   ├─▶ gpt-4o-mini plans { startUrl, steps[] }
-                                   ├─▶ Stagehand act() each step on Browserbase
-                                   ├─▶ page.screenshot() → ./public/last_action.png
-                                   ├─▶ Stagehand extract() → summary
-                                   │
-                                   └─▶ summary + screenshot URL back over iMessage
+                                   │  verify signature, rate limit, ack
+                                   ▼
+                            classify (gpt-5.5)
+                        ┌──────────┴──────────┐
+                  research tier          browser tier
+                  (no browser)          (Stagehand session)
+                        │                      │
+              search() 3-4 queries      observe → decide → act
+              fetch() 6 pages || md     auth wall? stop, never log in
+              synthesise → picks               │
+              retail lookup per pick    ───────┘ falls back to research
+                        │
+                        ▼
+              render → summary + links + screenshot ──▶ iMessage
 ```
+
+## Why two tiers
+
+`browserbase.search()` and `browserbase.fetch()` read public pages **without a
+browser session** — measured at 0.7s and 1.6s against a 2.7s session launch, with
+no anti-bot fight. Reading sources beats driving a browser for almost every
+request, so a browser only launches when a task genuinely needs interaction.
 
 ## Requirements
 
-- Node.js 18+ (built and checked on v24.15.0)
-- A Browserbase project, an OpenAI key, and a Linq API key
-- `ngrok` to expose localhost to Linq. Download it into this folder as
-  `ngrok.exe` from <https://ngrok.com/download> (gitignored, not committed)
+- Node.js 18+ (built on v24.15.0)
+- Browserbase project, OpenAI key, Linq API key + webhook signing secret
+- `ngrok` to expose localhost to Linq (download to this folder as `ngrok.exe`)
 
 ## Setup
 
@@ -30,97 +40,88 @@ iMessage ──▶ Linq webhook ──▶ POST /webhook/linq
 npm install
 ```
 
-Configuration lives in `.env` (see `.env.example`):
-
 | Variable | Purpose |
 | --- | --- |
-| `OPENAI_API_KEY` | Planning + Stagehand's reasoning model |
-| `OPENAI_MODEL` | Defaults to `openai/gpt-4o-mini` |
-| `LINQ_API_KEY` | Bearer token for Linq's outbound message API |
-| `LINQ_PHONE_NUMBER` | The agent's own number (reported by `/health`) |
-| `LINQ_API_URL` | Defaults to `https://api.linqapp.com/api/partner/v3/messages` |
-| `LINQ_WEBHOOK_SECRET` | `whsec_...` signing secret. Unset = unsigned requests accepted |
-| `BROWSERBASE_API_KEY` | Browserbase auth |
-| `BROWSERBASE_PROJECT_ID` | **Required.** From <https://www.browserbase.com/settings> |
-| `PORT` | HTTP port, default `3000` |
-| `PUBLIC_BASE_URL` | Public origin for screenshot links. Blank = auto-detect ngrok |
-| `TASK_TIMEOUT_MS` | Hard ceiling per browser task, default `180000` |
+| `OPENAI_API_KEY` | Reasoning and in-page extraction |
+| `OPENAI_MODEL` | Stagehand form — **`provider/` prefix required**, e.g. `openai/gpt-5.5` |
+| `OPENAI_MODEL_REASONING` | Bare form for direct calls, e.g. `gpt-5.5` |
+| `LINQ_API_KEY` | Bearer token for outbound messages |
+| `LINQ_WEBHOOK_SECRET` | `whsec_…` signing secret. Unset = unsigned requests accepted |
+| `BROWSERBASE_API_KEY` / `BROWSERBASE_PROJECT_ID` | Both required |
+| `PUBLIC_BASE_URL` | Blank = auto-detect the running ngrok tunnel |
+| `BROWSER_CONCURRENCY` | Max simultaneous Browserbase sessions (default 2) |
+| `RATE_LIMIT_PER_HOUR` | Per-sender cap (default 8) |
+| `TASK_TIMEOUT_MS` / `RESEARCH_BUDGET_MS` | Time budgets |
+| `ARTIFACT_TTL_MS` | How long screenshots stay fetchable (default 1h) |
+| `DEBUG_TOKEN` | Enables `POST /debug/run` |
 
 ## Run
 
 ```bash
 node index.js
+./ngrok.exe http 3000 --url https://<your-static-domain>.ngrok-free.dev
 ```
 
-Then, in a second terminal, expose it:
+Point the Linq `message.received` webhook at `https://<host>/webhook/linq`.
 
-```bash
-./ngrok.exe http 3000
-```
+## Playbooks
 
-The app reads ngrok's local API (`http://127.0.0.1:4040/api/tunnels`) on its own,
-so screenshot links resolve to the public tunnel with no extra configuration.
-Set `PUBLIC_BASE_URL` instead if you deploy somewhere with a fixed hostname.
+| Task type | Behaviour |
+| --- | --- |
+| `product_research` | Search review roundups, retailer listings **and forum opinion**, compare, then do a targeted retail lookup per pick for live price, stock and a regional buy link |
+| `factual_lookup` | Search, read, answer with cited key facts |
+| `social_media` | Public pages only. Never logs in |
+| `interactive_browse` | Drives a real browser, one observed step at a time |
 
-Finally, point your Linq webhook at `https://<your-ngrok-host>/webhook/linq`
-for the `message.received` event.
+## Design notes
 
-### ngrok first-run
+**Links cannot be hallucinated.** Synthesis schemas have no URL field. The model
+emits a `sourceIndex` integer and code maps it to a real URL from the fetched
+corpus, or to a retail URL that came from `search()` results. Anything out of
+range is dropped.
 
-ngrok v3 needs an authtoken once per machine:
+**The agent cannot log in.** `detectBlock()` runs before every decision and
+before any action — deterministic regexes over URL, title and accessibility
+tree, no LLM to talk around. On a wall it screenshots the wall, stops, and falls
+back to public sources. The decide-loop schema has no field capable of
+expressing a credential, so no code path can type one.
 
-```bash
-./ngrok.exe config add-authtoken <TOKEN>   # from dashboard.ngrok.com
-```
+**No blind step lists.** The browser tier observes the live page, picks an index
+into the observed actions, and feeds prior step outcomes back in — so it cannot
+decide to "click the second result" after already navigating away.
 
-## Endpoints
+**Retail findings are reconciled in code.** Synthesis runs before the price
+lookup, so its caveats are restated deterministically afterwards rather than
+being allowed to contradict the links right above them. Sold-out picks are
+demoted out of rank 1.
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/webhook/linq` | Linq inbound webhook. Acks in <1s, works in background |
-| `GET` | `/health` | Config sanity check + detected public URL |
-| `GET` | `/last_action.png` | Latest screenshot, served from `./public` |
-| `GET` | `/` | Service banner |
-
-## Webhook security
-
-Inbound webhooks are verified against the [Standard Webhooks](https://www.standardwebhooks.com/)
-spec that Linq signs with: HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{raw body}`,
-keyed by the base64-decoded `whsec_` secret, compared in constant time, with a
-300-second replay window. Anything that fails gets a `401`.
-
-This matters because the endpoint is publicly reachable through the tunnel —
-without it, anyone who learned the URL could trigger Browserbase sessions and
-outbound messages on your account.
-
-Leaving `LINQ_WEBHOOK_SECRET` unset disables the check (and logs a warning at
-startup), which is only appropriate for local testing.
+**Artifacts are per-run.** `public/runs/<uuid>/<n>.png`, swept on a TTL.
+Concurrent requests can never see each other's screenshots.
 
 ## Testing without iMessage
 
-With `LINQ_WEBHOOK_SECRET` unset, a plain request works:
-
 ```bash
-curl -X POST http://localhost:3000/webhook/linq \
-  -H "Content-Type: application/json" \
-  -d '{"senderNumber":"+14155559876","messageText":"what is the top story on Hacker News?"}'
+curl -X POST http://localhost:3000/debug/run \
+  -H "Content-Type: application/json" -H "x-debug-token: $DEBUG_TOKEN" \
+  -d '{"text":"best power bank, top 3 with links, I live in Canada"}'
 ```
 
-The webhook accepts both the flat shape above and Linq's real v3 envelope
-(`data.sender_handle.handle` + `data.parts[].value`).
+Returns the classification, corpus, structured data and rendered message as
+JSON, and **sends nothing over iMessage**.
 
-With the secret set, requests must carry valid `webhook-id`,
-`webhook-timestamp` and `webhook-signature` headers. Note that a request which
-passes verification runs a real browser task and bills a Browserbase session.
+## Endpoints
+
+| Method | Path | |
+| --- | --- | --- |
+| `POST` | `/webhook/linq` | Signature-verified inbound webhook; acks in <1s |
+| `POST` | `/debug/run` | Full pipeline as JSON, no message sent |
+| `GET` | `/health` | Config, models, active sessions, queue depth |
+| `GET` | `/runs/<uuid>/<n>.png` | Run screenshots |
 
 ## Notes
 
-- Stagehand v4 replaced the older `env: "BROWSERBASE"` / `stagehand.agent()` API.
-  This app uses the current surface: `browserbase.launch()` → `Stagehand.create({ browser })`
-  → `act()` / `extract()`.
-- Screenshot links carry a `?v=<timestamp>` cache-buster, because the filename is
-  fixed and iMessage would otherwise show the previous run's image.
-- Failed intermediate steps are logged and skipped rather than aborting, so the
-  sender still gets a screenshot and a summary of wherever the browser ended up.
-- `.env` holds live credentials and is gitignored. Rotate the keys if this folder
-  is ever shared.
+- Stagehand v4 has no `stagehand.agent()` and no `env: "BROWSERBASE"`. This uses
+  the current surface: `browserbase.launch()` → `Stagehand.create({ browser })`.
+- gpt-5 models reject an explicit `temperature`; it is only sent for models that
+  accept it.
+- `.env` holds live credentials and is gitignored. Rotate if this folder is shared.
