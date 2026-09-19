@@ -1702,45 +1702,132 @@ async function ensureContext(sender) {
 }
 
 /**
- * Open a browser the user can drive, parked on the page that asked them to
- * sign in. keepAlive holds it open while they do; without it the session ends
- * the moment this function returns and there is nothing to log in to.
+ * A minimal Chrome DevTools Protocol client over the session's websocket.
+ *
+ * Stagehand cannot be used to park the login session. It drives pages through
+ * an injected extension world, and on a fresh session that world is not ready
+ * when the first navigation goes out:
+ *
+ *   Stagehand extension world not ready for frame ...; checked contexts: 1, 2
+ *
+ * That error was being caught and logged as "not fatal", so every handoff
+ * silently handed over a blank tab and the user had to find the site
+ * themselves. CDP talks to the browser directly and has nothing to warm up.
+ * Node has had a global WebSocket since 22, so this needs no dependency.
  */
-async function startLoginSession(sender, url) {
-  const contextId = await ensureContext(sender);
+function cdpConnect(wsUrl, { timeoutMs = 20000 } = {}) {
+  const ws = new WebSocket(wsUrl);
+  const pending = new Map();
+  let seq = 0;
 
-  // Created through Stagehand's launcher rather than the raw SDK, because a
-  // session made without its extension cannot then be driven by it - which is
-  // what left the live view sitting on a blank page instead of the sign-in
-  // form the user was sent there to fill in.
-  const browser = await launchSession({
-    keepAlive: true,
-    browserSettings: { context: { id: contextId, persist: true } },
+  ws.addEventListener("message", (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    const waiter = msg.id && pending.get(msg.id);
+    if (!waiter) return;
+    pending.delete(msg.id);
+    msg.error ? waiter.reject(new Error(msg.error.message)) : waiter.resolve(msg.result);
   });
 
-  try {
-    // browser.context only becomes usable once Stagehand is attached; the
-    // handle alone cannot open a page.
-    await Stagehand.create({
-      browser,
-      model: { modelName: OPENAI_MODEL, apiKey: OPENAI_API_KEY },
-    });
-    const page = await browser.context.newPage(url);
-    await page.waitForLoadState("load").catch(() => {});
-    console.log(`[login] session parked on ${url}`);
-  } catch (err) {
-    // Not fatal: the live view still opens, the user just has to navigate.
-    console.warn(`[login] could not park the session on ${url}: ${err.message}`);
-  }
+  const ready = new Promise((resolve, reject) => {
+    ws.addEventListener("open", resolve, { once: true });
+    ws.addEventListener("error", () => reject(new Error("CDP socket failed")), { once: true });
+    setTimeout(() => reject(new Error("CDP connect timed out")), timeoutMs);
+  });
+
+  return {
+    ready,
+    close: () => ws.close(),
+    send(method, params = {}, sessionId) {
+      return new Promise((resolve, reject) => {
+        const id = ++seq;
+        pending.set(id, { resolve, reject });
+        ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        setTimeout(() => {
+          if (!pending.delete(id)) return;
+          reject(new Error(`${method} timed out`));
+        }, timeoutMs);
+      });
+    },
+  };
+}
+
+/**
+ * The live view is opened on a phone, so the browser behind it is phone-shaped.
+ *
+ * Browserbase defaults to a desktop window, which the DevTools live view then
+ * scales down to fit a phone screen - a 1280px page on a 390px screen, where
+ * every tap target is a third of its intended size. Matching the viewport to
+ * the device means the page lays itself out for that width and the live view
+ * renders it roughly 1:1.
+ *
+ * Deliberately NOT paired with Emulation.setDeviceMetricsOverride({mobile}) or
+ * a phone user agent. Both were tried. Claiming to be iOS Safari over a Linux
+ * TLS fingerprint got the navigation blocked outright (chrome-error://), and
+ * mobile metrics alone made Instagram serve its app-install interstitial,
+ * which has a "Log in" button and no form at all - measurably worse than the
+ * desktop layout, which renders the real username and password fields.
+ */
+const LOGIN_VIEWPORT = { width: 390, height: 844 };
+
+async function startLoginSession(sender, url) {
+  const contextId = await ensureContext(sender);
+  const browser = await launchSession({
+    keepAlive: true,
+    browserSettings: {
+      context: { id: contextId, persist: true },
+      viewport: LOGIN_VIEWPORT,
+    },
+  });
   // Deliberately not closing the handle: closing it ends the session, and the
   // whole point is that it outlives this turn while the user signs in.
 
-  const session = { id: browser.sessionId };
-  const live = await bb.sessions.debug(session.id);
+  const sessionId = browser.sessionId;
+  let parked = false;
+  try {
+    const debug = await bb.sessions.debug(sessionId);
+    const cdp = cdpConnect(debug.wsUrl);
+    await cdp.ready;
+    try {
+      const { targetInfos } = await cdp.send("Target.getTargets");
+      const target = targetInfos.find((t) => t.type === "page");
+      if (!target) throw new Error("session has no page target");
+      // Navigate the tab that already exists rather than opening a second one,
+      // so the live view link and the signed-in page are the same tab.
+      const attached = await cdp.send("Target.attachToTarget", {
+        targetId: target.targetId,
+        flatten: true,
+      });
+      await cdp.send("Page.enable", {}, attached.sessionId);
+      await cdp.send("Page.navigate", { url }, attached.sessionId);
+      parked = true;
+      console.log(`[login] parked on ${url}`);
+    } finally {
+      cdp.close();
+    }
+  } catch (err) {
+    // Not fatal, but it is the difference between "sign in here" and "go find
+    // the site yourself", so the caller is told and says so.
+    console.warn(`[login] could not park on ${url}: ${err.message}`);
+  }
+
+  // Re-read after navigating: the page-level link targets the parked tab
+  // directly, where the session-level one depends on which tab is frontmost.
+  const live = await bb.sessions.debug(sessionId);
+  const page = live.pages?.[0];
   return {
     contextId,
-    sessionId: session.id,
-    liveUrl: live.debuggerFullscreenUrl || live.debuggerUrl,
+    sessionId,
+    parked,
+    liveUrl:
+      page?.debuggerFullscreenUrl ||
+      live.debuggerFullscreenUrl ||
+      page?.debuggerUrl ||
+      live.debuggerUrl,
   };
 }
 
@@ -2279,13 +2366,23 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
     }
     mem.pendingLogin = { ...login, ...handoff, stage: "waiting", at: Date.now() };
     const note =
-      `Open this and sign in to ${login.host} yourself - it's a browser running on my side, ` +
-      `so your password goes straight to ${login.host} and never through me:
+      (handoff.parked
+        ? `Open this - it's a browser running on my side, already on the ${login.host} sign-in page. `
+        : `Open this and go to ${login.host} - it's a browser running on my side. `) +
+      `Your password goes straight to ${login.host} and never through me:
 
 ${handoff.liveUrl}
 
 ` +
-      `Text me "done" when you're in and I'll pick the task back up. ` +
+      // The live view is a screencast of a remote screen, so a phone keyboard
+      // does not always open when you tap a field - there is no real input on
+      // your device to focus. Better to say so than let them fight it: the
+      // session stays up for 30 minutes and the link works from any device.
+      `If your keyboard won't come up when you tap a field, open the same link on a ` +
+      `laptop - it's a remote screen, so phones don't always offer the keyboard. ` +
+      `You've got 30 minutes.
+
+Text me "done" when you're in and I'll pick the task back up. ` +
       `Don't share that link - anyone with it can drive that browser.`;
     // The live view URL is deliberately not stored in history: it is a bearer
     // handle to a running browser, and history goes into later prompts.
@@ -2534,6 +2631,44 @@ app.post("/debug/turn", async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack, sent });
+  }
+});
+
+/**
+ * Start a real login handoff, report what the user would be handed, release it.
+ *
+ * This exists because the parking failure was invisible: it was caught, logged
+ * as "not fatal", and every handoff quietly delivered a blank tab. Checking it
+ * needs a real session, so this drives the shipping startLoginSession rather
+ * than a copy of it, and always releases what it started.
+ *
+ * Costs one Browserbase session per call, so it is not in the fast suite.
+ */
+app.post("/debug/login", async (req, res) => {
+  if (!DEBUG_TOKEN || req.get("x-debug-token") !== DEBUG_TOKEN) {
+    return res.status(404).json({ error: "not found" });
+  }
+  const from = String(req.body?.from ?? "+15550000000");
+  const url = String(req.body?.url ?? "https://www.instagram.com/accounts/login/");
+  const started = Date.now();
+  let handoff;
+  try {
+    handoff = await startLoginSession(from, url);
+    const live = await bb.sessions.debug(handoff.sessionId);
+    res.json({
+      elapsedMs: Date.now() - started,
+      parked: handoff.parked,
+      landedOn: live.pages?.[0]?.url ?? null,
+      // The live URL itself is withheld on purpose: it is a bearer handle to a
+      // running browser and this response is easy to paste somewhere.
+      liveUrlKind: handoff.liveUrl?.includes("/devtools-fullscreen/") ? "fullscreen" : "other",
+      viewport: LOGIN_VIEWPORT,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (handoff?.sessionId) await finishLoginSession(handoff.sessionId);
+    senderContexts.delete(from);
   }
 });
 
