@@ -1838,6 +1838,74 @@ async function withCdpPage(sessionId, fn) {
 }
 
 /**
+ * What a page looks like after a credential goes in.
+ *
+ * Reports a one-time-code field positively rather than inferring success from
+ * the absence of a password field. That inference is what told a user "you're
+ * in" while Instagram was emailing them a code: the password form had been
+ * replaced, nothing matched the block regexes at that instant, so "no password"
+ * read as "signed in".
+ */
+const READ_LOGIN_STATE = `(() => {
+  const visible = (el) => {
+    const b = el.getBoundingClientRect();
+    return b.width > 20 && b.height > 10;
+  };
+  const usable = (i) => visible(i) && !i.disabled;
+  const pass = [...document.querySelectorAll('input[type=password]')].find(usable);
+  const code = [...document.querySelectorAll('input')].find((i) => {
+    if (!usable(i) || i.type === 'password') return false;
+    const tag = [i.name, i.id, i.getAttribute('aria-label'), i.placeholder].join(' ');
+    if (i.autocomplete === 'one-time-code') return true;
+    if (/\\b(code|otp|verif|security|two.?factor|2fa|challenge)/i.test(tag)) return true;
+    // A short numeric box is the other common shape, e.g. six single digits.
+    return i.inputMode === 'numeric' && i.maxLength > 0 && i.maxLength <= 8;
+  });
+  return JSON.stringify({
+    url: location.href,
+    title: document.title,
+    hasPassword: Boolean(pass),
+    hasCodeField: Boolean(code),
+    text: (document.body.innerText || '').slice(0, 600),
+  });
+})()`;
+
+/**
+ * Language a site uses when it wants a second factor.
+ *
+ * Belt and braces with hasCodeField: some flows show the prompt before the
+ * input, or render the digits as something other than an <input>.
+ */
+const TWOFA_RE =
+  /(verification|security|login|authentication) code|two[- ]?factor|\b2fa\b|enter the code|we sent (you )?a|check your (email|inbox|phone)|confirm it'?s you|approve (this )?login/i;
+
+/**
+ * Wait for the page to stop moving instead of sampling at a fixed moment.
+ *
+ * A submit kicks off a navigation, and the old code looked exactly once, six
+ * seconds later. That landed mid-flight often enough to matter - the login form
+ * already gone, the next page not yet arrived, which reads as success under any
+ * absence-based test.
+ */
+async function settlePage(page, { budgetMs = 25000, stableTicks = 3 } = {}) {
+  let last = null;
+  let stable = 0;
+  const started = Date.now();
+  while (Date.now() - started < budgetMs) {
+    const now = await page
+      .evaluate(`location.href + "|" + document.readyState`)
+      .catch(() => null);
+    if (now && now === last) {
+      if (++stable >= stableTicks) return;
+    } else {
+      last = now;
+      stable = 0;
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+}
+
+/**
  * Locate a sign-in form without knowing the site.
  *
  * Runs in the page and returns a plain description, never any value. Anchoring
@@ -1920,27 +1988,76 @@ async function fillCredentials(sessionId, { username, password }) {
       if (f) f.submit();
     })()`);
 
-    // Give the navigation a chance, then report what the page became. This is
-    // the only signal available for whether the credential worked.
-    await new Promise((r) => setTimeout(r, 6000));
-    const after = JSON.parse(
-      (await page.evaluate(`JSON.stringify({
-        url: location.href,
-        stillHasPassword: Boolean(document.querySelector('input[type=password]')),
-        text: (document.body.innerText || '').slice(0, 400)
-      })`)) ?? "{}",
-    );
-    const block = blockFromText({ url: after.url ?? "", body: after.text ?? "" });
-    const signedIn = !after.stillHasPassword && !block.blocked;
-    return {
-      ok: signedIn,
-      url: after.url ?? null,
-      reason: signedIn
-        ? null
-        : after.stillHasPassword
-          ? "the sign-in page is still showing - the details may be wrong, or it wants a code"
-          : `still gated (${block.kind ?? "unknown"})`,
-    };
+    await settlePage(page);
+    return readOutcome(page);
+  });
+}
+
+/**
+ * Decide what the page became, in order of how much it tells us.
+ *
+ * A code prompt is checked first and reported as its own outcome rather than as
+ * failure, because it means the password was accepted - the user is one step
+ * from being in, and telling them "that didn't work" would be both wrong and
+ * the end of the road.
+ */
+async function readOutcome(page) {
+  const s = JSON.parse((await page.evaluate(READ_LOGIN_STATE)) ?? "{}");
+  const text = s.text ?? "";
+
+  if (s.hasCodeField || TWOFA_RE.test(text)) {
+    return { ok: false, needsCode: true, url: s.url ?? null, reason: "a verification code is needed" };
+  }
+  if (s.hasPassword) {
+    return { ok: false, url: s.url ?? null, reason: "the sign-in page is still showing - the details look wrong" };
+  }
+  const block = blockFromText({ url: s.url ?? "", title: s.title ?? "", body: text });
+  if (block.blocked) {
+    return { ok: false, url: s.url ?? null, reason: `still gated (${block.kind ?? "unknown"})` };
+  }
+  return { ok: true, url: s.url ?? null, reason: null };
+}
+
+/**
+ * Type a one-time code into whatever field is waiting for it.
+ *
+ * Some sites split the digits across several single-character boxes, so the
+ * code is dispatched a character at a time to whatever currently has focus -
+ * that is what those inputs are built to handle, and it works for one box too.
+ */
+async function fillCode(sessionId, code) {
+  return withCdpPage(sessionId, async (page) => {
+    const before = JSON.parse((await page.evaluate(READ_LOGIN_STATE)) ?? "{}");
+    if (!before.hasCodeField && !TWOFA_RE.test(before.text ?? "")) {
+      return { ok: false, reason: "that page isn't asking for a code any more" };
+    }
+
+    await page.evaluate(`(() => {
+      const visible = (el) => { const b = el.getBoundingClientRect(); return b.width > 20 && b.height > 10; };
+      const i = [...document.querySelectorAll('input')].find((el) => visible(el) && !el.disabled &&
+        (el.autocomplete === 'one-time-code' ||
+         /\\b(code|otp|verif|security|two.?factor|2fa|challenge)/i.test([el.name, el.id, el.getAttribute('aria-label'), el.placeholder].join(' ')) ||
+         (el.inputMode === 'numeric' && el.maxLength > 0 && el.maxLength <= 8)));
+      if (i) { i.focus(); i.select && i.select(); }
+    })()`);
+
+    for (const ch of String(code).trim()) {
+      await page.send("Input.insertText", { text: ch });
+      await new Promise((r) => setTimeout(r, 60));
+    }
+
+    await page.evaluate(`(() => {
+      const visible = (el) => { const b = el.getBoundingClientRect(); return b.width > 20 && b.height > 10; };
+      const btn = [...document.querySelectorAll('button, input[type=submit], div[role=button]')]
+        .filter(visible)
+        .find((b) => /confirm|continue|submit|verify|next|log ?in|done/i.test(b.innerText || b.value || ''));
+      if (btn) { btn.click(); return; }
+      const f = document.querySelector('form');
+      if (f && f.requestSubmit) f.requestSubmit();
+    })()`);
+
+    await settlePage(page);
+    return readOutcome(page);
   });
 }
 
@@ -2104,15 +2221,16 @@ function sweepUnlockTokens() {
  * autocomplete="current-password" and a matching username field are what let
  * iOS Keychain and 1Password offer to fill it, which is most of the point.
  */
-function unlockPage({ host, token, error = "" }) {
+function unlockPage({ host, kind = "credentials", error = "" }) {
   const safeHost = String(host).replace(/[<>&"]/g, "");
+  const isCode = kind === "code";
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<title>Sign in to ${safeHost}</title>
+<title>${isCode ? "Verification code" : `Sign in to ${safeHost}`}</title>
 <style>
   :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#d8d8d8; --accent:#1b6ef3; --bad:#b3261e; }
   @media (prefers-color-scheme: dark) {
@@ -2138,15 +2256,20 @@ function unlockPage({ host, token, error = "" }) {
 </head>
 <body>
 <div class="card" id="card">
-  <h1>Sign in to ${safeHost}</h1>
-  <p class="sub">This goes straight into the browser already waiting on that page. Used once, then discarded.</p>
+  <h1>${isCode ? "Enter your code" : `Sign in to ${safeHost}`}</h1>
+  <p class="sub">${isCode
+    ? `${safeHost} sent you a code. Your password already went through - this is the last step.`
+    : "This goes straight into the browser already waiting on that page. Used once, then discarded."}</p>
   <form id="f" autocomplete="on">
     <input type="hidden" name="host" value="${safeHost}">
-    <label for="u">Username or email</label>
+${isCode
+  ? `    <label for="c">Verification code</label>
+    <input id="c" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" autocorrect="off" spellcheck="false" required>`
+  : `    <label for="u">Username or email</label>
     <input id="u" name="username" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
     <label for="p">Password</label>
-    <input id="p" name="password" type="password" autocomplete="current-password" required>
-    <button type="submit" id="b">Sign in</button>
+    <input id="p" name="password" type="password" autocomplete="current-password" required>`}
+    <button type="submit" id="b">${isCode ? "Confirm" : "Sign in"}</button>
   </form>
   ${error ? `<div class="err">${String(error).replace(/[<>&]/g, "")}</div>` : ""}
   <p class="note">This link works once and expires in 10 minutes. Nothing typed here is logged or stored.</p>
@@ -2161,7 +2284,7 @@ function unlockPage({ host, token, error = "" }) {
       const r = await fetch(location.pathname, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: f.username.value, password: f.password.value }),
+        body: JSON.stringify(${isCode ? "{ code: f.code.value }" : "{ username: f.username.value, password: f.password.value }"}),
       });
       out = await r.json();
     } catch (err) {
@@ -2171,6 +2294,10 @@ function unlockPage({ host, token, error = "" }) {
     if (out.ok) {
       document.getElementById('card').innerHTML =
         '<div class="ok"><h1>You\\u2019re in</h1><p class="sub">Go back to Messages \\u2014 the task is running now.</p></div>';
+    } else if (out.codePath) {
+      // Password accepted, second factor wanted. Go straight to the code form
+      // rather than sending them back to Messages for a link already in hand.
+      location.href = out.codePath;
     } else {
       b.disabled = false; b.textContent = 'Try again';
       const d = document.createElement('div');
@@ -2664,8 +2791,77 @@ function shouldAck(taskType, tier) {
  * second message sees the first one's answer in history instead of routing
  * against stale state.
  */
+/** A handoff parked at a code prompt, if one is live for this sender. */
+function pendingCodeStep(sender) {
+  const p = conversations.get(sender)?.pendingLogin;
+  if (!p || p.stage !== "code") return null;
+  return Date.now() - p.at < LOGIN_SESSION_SECONDS * 1000 ? p : null;
+}
+
+/**
+ * Type a texted code into the waiting browser and carry on.
+ *
+ * Records only that a code was received, never the digits themselves - the same
+ * discipline as the unlock route, which is the other way in.
+ */
+async function submitPendingCode(sender, login, code, send) {
+  recordTurn(sender, "user", "(sent a verification code)", "user");
+  let outcome;
+  try {
+    outcome = await fillCode(login.sessionId, code);
+  } catch (err) {
+    console.warn(`[login] code entry failed: ${err.message}`);
+    outcome = { ok: false, reason: "I couldn't reach that browser session any more" };
+  }
+
+  if (!outcome.ok) {
+    const note = `That code didn't go through - ${outcome.reason ?? "the site didn't accept it"}. Send me a new one?`;
+    recordTurn(sender, "assistant", note, "error");
+    await send(sender, [{ type: "text", value: note }]);
+    return { mode: "login_code", reasoning: "code rejected", reply: note, resolvedRequest: "", referencesPriorResult: false };
+  }
+
+  console.log(`[login] code accepted for ${login.host}`);
+  markSignedIn(sender, login.host);
+  const mem = conversations.get(sender);
+  if (mem) mem.pendingLogin = null;
+  await finishLoginSession(login.sessionId);
+
+  if (login.request?.trim()) {
+    await send(sender, [{ type: "text", value: `In. Picking that back up now.` }]);
+    const result = await handleRequest(sender, login.request, {
+      conversation: mem ?? undefined,
+      send,
+      contextId: login.contextId,
+    });
+    if (result) {
+      recordTaskResult(sender, result);
+      recordTurn(sender, "assistant", result.text, "task");
+    }
+  } else {
+    await send(sender, [{ type: "text", value: `In - you're signed in to ${login.host}.` }]);
+  }
+  return { mode: "login_code", reasoning: "code accepted", reply: "", resolvedRequest: "", referencesPriorResult: false };
+}
+
 async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnly = false } = {}) {
   const { text: safeText, hadSecret } = redactSecrets(messageText);
+
+  // A site is mid-login and asked for a code, so a code is what this message
+  // most likely is. Checked before redaction and before the router, both of
+  // which would otherwise refuse it - which is exactly what happened: a user
+  // was emailed six digits, texted them, and got "I can't take login codes".
+  //
+  // Narrow on purpose. It needs a handoff already waiting at the code step, and
+  // the digits are read out of the raw text and used immediately, never logged,
+  // stored or routed. Outside that window the ordinary refusal still stands.
+  {
+    const waiting = pendingCodeStep(senderNumber);
+    const digits = waiting && String(messageText).match(/\b(\d[\d\s-]{3,10}\d)\b/);
+    if (waiting && digits) {
+      return submitPendingCode(senderNumber, waiting, digits[1].replace(/[\s-]/g, ""), send);
+    }
+  }
 
   // Deterministic, and before any model call: if a credential came through,
   // the raw text must not reach the router, the store, or OpenAI.
@@ -3063,7 +3259,7 @@ app.get("/unlock/:token", (req, res) => {
   if (!entry) return res.status(404).type("html").send("<h1>This link has expired</h1>");
   res.set("Cache-Control", "no-store");
   res.set("Referrer-Policy", "no-referrer");
-  res.type("html").send(unlockPage({ host: entry.host, token: req.params.token }));
+  res.type("html").send(unlockPage({ host: entry.host, kind: entry.kind ?? "credentials" }));
 });
 
 /**
@@ -3082,16 +3278,35 @@ app.post("/unlock/:token", async (req, res) => {
   // one, which is what makes "single use" true even if the fill throws.
   pendingUnlock.delete(token);
 
-  const username = String(req.body?.username ?? "");
+  const isCode = entry.kind === "code";
+  const code = String(req.body?.code ?? "");
   const password = String(req.body?.password ?? "");
-  if (!password) return res.status(400).json({ ok: false, reason: "no password given" });
+  if (isCode ? !code : !password) {
+    return res.status(400).json({ ok: false, reason: isCode ? "no code given" : "no password given" });
+  }
 
   let outcome;
   try {
-    outcome = await fillCredentials(entry.sessionId, { username, password });
+    outcome = isCode
+      ? await fillCode(entry.sessionId, code)
+      : await fillCredentials(entry.sessionId, {
+          username: String(req.body?.username ?? ""),
+          password,
+        });
   } catch (err) {
     console.warn(`[unlock] fill failed: ${err.message}`);
     return res.status(500).json({ ok: false, reason: "could not reach the browser session" });
+  }
+
+  // A second factor is not a failure - the password was accepted. Keep the
+  // session parked exactly where it is and hand over a code form. This is the
+  // step that was missing when a user was told "you're in" and then got an
+  // email from Instagram with a code and nowhere to put it.
+  if (outcome.needsCode) {
+    const next = mintUnlockToken({ ...entry, kind: "code" });
+    console.log(`[unlock] ${entry.host} wants a verification code`);
+    noteCodePending(entry, next);
+    return res.json({ ok: false, needsCode: true, codePath: `/unlock/${next}`, reason: outcome.reason });
   }
 
   if (!outcome.ok) {
@@ -3111,6 +3326,45 @@ app.post("/unlock/:token", async (req, res) => {
     .then(() => resumeAfterLogin(entry))
     .catch((err) => console.warn(`[unlock] resume failed: ${err.message}`));
 });
+
+/**
+ * Record that a site is waiting on a code, and text the form for it.
+ *
+ * The browser stays parked mid-login, so this has to survive the user closing
+ * the page. It also puts the conversation into a state where a code typed
+ * straight into iMessage can be used - see the pendingLogin "code" branch in
+ * handleTurn. Someone who has just been emailed six digits will often paste
+ * them into the thread, and answering that with a refusal, as this did, strands
+ * them with no way to finish.
+ */
+function noteCodePending(entry, token) {
+  const mem = conversations.get(entry.sender);
+  if (mem) {
+    mem.pendingLogin = {
+      ...(mem.pendingLogin ?? {}),
+      stage: "code",
+      host: entry.host,
+      sessionId: entry.sessionId,
+      contextId: entry.contextId,
+      request: entry.request,
+      at: Date.now(),
+    };
+  }
+  resolvePublicBaseUrl()
+    .then((base) => {
+      if (!base) return null;
+      return sendLinq(entry.sender, [
+        {
+          type: "text",
+          value:
+            `${entry.host} wants a verification code - check your email or texts. ` +
+            `Put it in here:\n\n${base}/unlock/${token}\n\n` +
+            `Or just text me the code and I'll enter it.`,
+        },
+      ]);
+    })
+    .catch((err) => console.warn(`[unlock] could not send the code link: ${err.message}`));
+}
 
 /**
  * Carry on with whatever the user originally asked for, now signed in.
