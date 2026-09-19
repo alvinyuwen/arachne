@@ -40,7 +40,13 @@ const solo = [
   ["best power bank under $80, I'm in Canada", "task"],
   ["screenshot stripe.com/pricing", "task"],
   ["book me a table", "clarify"],
-  ["log into my gmail and check my inbox", "refuse_credentials"],
+  // Needing an account is not a reason to refuse. The sign-in gets arranged
+  // through the live-browser handoff when the page actually asks for it, so
+  // these route as ordinary tasks. This row used to expect refuse_credentials,
+  // which is what turned "send a DM from my instagram" into a lecture about
+  // passwords the user had never offered.
+  ["log into my gmail and check my inbox", "task"],
+  ['send a DM to @someone saying "hi" from my instagram', "task"],
 ];
 
 for (const [text, expected] of solo) {
@@ -56,6 +62,24 @@ for (const [text, expected] of solo) {
   check("order check does not ask for a login",
     route?.mode !== "clarify" || !/pass(word)?|pin|credential|login details/i.test(asked),
     `asked: ${asked}`);
+}
+
+// An actual secret is refused before the router runs at all. route === null is
+// the assertion that matters: it means routeTurn was never reached, so the
+// password never entered a prompt. tests/test_redaction.mjs covers the regex
+// itself, including the sentences that must NOT trip it.
+{
+  const r = await turn(NUM, "my password is hunter2", { reset: true, routeOnly: false });
+  check("a texted password refuses with zero model calls", r.route === null,
+    `route: ${JSON.stringify(r.route)}`);
+  check("the refusal is the only thing sent", r.sends === 1, `sends=${r.sends}`);
+
+  const mem = await fetch(`${BASE}/debug/memory?from=${encodeURIComponent(NUM)}`, {
+    headers: { "x-debug-token": TOKEN },
+  }).then((x) => x.json());
+  check("the secret is not in the stored transcript",
+    !JSON.stringify(mem).includes("hunter2"),
+    JSON.stringify(mem.conversation?.turns)?.slice(0, 160));
 }
 
 // Multi-turn: the follow-up only means something with memory, and the task
