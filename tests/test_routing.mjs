@@ -55,6 +55,36 @@ for (const [text, expected] of solo) {
     `got ${route?.mode} (${route?.reasoning})`);
 }
 
+// Watch intents. The distinction the router has to hold is WHEN the answer is
+// wanted, not what it is about: the same subject is a task or a watch depending
+// on whether they want it now or later.
+//
+// These are all self-contained. Phrasings like "keep an eye on THIS" are
+// deliberately not here: with a fresh conversation "this" refers to nothing,
+// and clarifying is the right answer. They are exercised further down, where
+// there is a real prior result for them to point at.
+const watchCases = [
+  ["tell me when the keychron k2 drops below $80", "watch"],
+  ["let me know when the RTX 5090 is back in stock", "watch"],
+  ["tell me when hack the north applications open", "watch"],
+  ["track the amazon stock price and text me every hour", "watch"],
+  ["remind me 3 days before the hack the north deadline", "watch"],
+  ["watch https://example.com/pricing and tell me if it changes", "watch"],
+  ["what am I watching", "watch_manage"],
+  ["stop watching the keyboard", "watch_manage"],
+  ["stop all my alerts", "watch_manage"],
+  ["change the keyboard alert to $70", "watch_manage"],
+  // The other side of the line: these ask for an answer now, not later.
+  ["what's the price of a keychron k2", "task"],
+  ["what's the weather in Toronto right now", "task"],
+];
+
+for (const [text, expected] of watchCases) {
+  const { route } = await turn(NUM, text, { reset: true });
+  check(`"${text}" -> ${expected}`, route?.mode === expected,
+    `got ${route?.mode} (${route?.reasoning})`);
+}
+
 // A clarify must never be the one asking for a credential.
 {
   const { route } = await turn(NUM, "check my amazon order status", { reset: true });
@@ -108,6 +138,17 @@ for (const [text, expected] of solo) {
   check("\"cheaper?\" carries the subject forward",
     /power bank/i.test(cheaper.route?.resolvedRequest ?? ""),
     `resolved: ${cheaper.route?.resolvedRequest}`);
+
+  // The flagship sequence: search, then ask to be told later. Only meaningful
+  // with a prior result - the same words with nothing to point at are a
+  // clarify, which is correct and asserted by their absence above.
+  const watchIt = await turn(NUM, "tell me if one goes under $60");
+  check("a referential watch routes as watch", watchIt.route?.mode === "watch",
+    `got ${watchIt.route?.mode} (${watchIt.route?.reasoning})`);
+
+  const keepEye = await turn(NUM, "keep an eye on that for me");
+  check("\"keep an eye on that\" routes as watch", keepEye.route?.mode === "watch",
+    `got ${keepEye.route?.mode}`);
 }
 
 // Memory bounds.

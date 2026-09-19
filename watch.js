@@ -402,10 +402,21 @@ export function describe(watch, obs) {
     if (condition.op === "changes") return `${what} changed to ${unit}${v}`;
     return `${what} is ${unit}${v}`;
   }
-  if (kind === "state") return `${what} is now ${obs?.state}`;
-  if (kind === "presence") return condition.op === "appears" ? `${what} showed up` : `${what} is gone`;
+  // Same rule as the numeric branch: an unread value is reported as nothing,
+  // not printed. "closes in null days" and "is now unknown" are what happens
+  // when a page does not carry what the watch is looking for, and saying so
+  // badly is worse than saying nothing.
+  if (kind === "state") {
+    const s = obs?.state;
+    return !s || s === "unknown" ? "" : `${what} is now ${String(s).replace(/_/g, " ")}`;
+  }
+  if (kind === "presence") {
+    if (typeof obs?.present !== "boolean") return "";
+    return condition.op === "appears" ? `${what} showed up` : `${what} is gone`;
+  }
   if (kind === "deadline") {
-    const days = obs?.deadlineAt ? Math.max(0, Math.round((obs.deadlineAt - Date.now()) / DAY)) : null;
+    if (obs?.deadlineAt == null) return "";
+    const days = Math.max(0, Math.round((obs.deadlineAt - Date.now()) / DAY));
     return days === 0 ? `${what} closes today` : `${what} closes in ${days} day${days === 1 ? "" : "s"}`;
   }
   return "something changed";

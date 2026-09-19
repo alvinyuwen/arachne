@@ -1659,10 +1659,70 @@ function parseDateish(text) {
  * and standing up a browser for it would cost 30 seconds and real money on
  * every tick of every watch.
  */
+/** Turn whatever the extractor returned into the typed observation. */
+function shapeObservation(watch, d, url) {
+  const at = Date.now();
+  if (watch.kind === "numeric") {
+    return {
+      url, at,
+      value: parseAmount(d.valueText),
+      raw: d.valueText ?? null,
+      unit: parseUnit(d.valueText) ?? watch.condition?.unit ?? null,
+      title: d.title ?? null,
+      state: labelState(d.soldOutText),
+    };
+  }
+  if (watch.kind === "state") {
+    return { url, at, state: labelState(d.stateText), raw: d.stateText ?? null, title: d.title ?? null };
+  }
+  if (watch.kind === "presence") {
+    return { url, at, present: Boolean(d.found), evidence: d.evidence ?? null };
+  }
+  return { url, at, deadlineAt: parseDateish(d.dateText), raw: d.dateText ?? null, title: d.title ?? null };
+}
+
+/** Did the extractor actually find anything, or come back empty-handed? */
+function observationIsEmpty(watch, obs) {
+  if (watch.kind === "numeric") return obs.value == null && !obs.raw;
+  if (watch.kind === "state") return obs.state === "unknown" && !obs.raw;
+  if (watch.kind === "deadline") return obs.deadlineAt == null && !obs.raw;
+  return obs.present !== true && !obs.evidence;
+}
+
+/**
+ * Read a page that only exists after JavaScript runs.
+ *
+ * browserbase.fetch returns zero characters for a client-rendered site -
+ * hackthenorth.com is one - so a watch on such a page would report "could not
+ * read" forever while the page sits there perfectly readable in a browser.
+ * This is the same degradation ladder the task pipeline already uses, applied
+ * one step at a time: cheap fetch first, real session only when it comes back
+ * empty.
+ */
+async function observeViaBrowser(watch, url) {
+  const schema = OBSERVE_SCHEMAS[watch.kind](watch.metric || "value");
+  return withSession(async ({ browser, stagehand }) => {
+    const page = await browser.context.newPage(url);
+    await page.waitForLoadState("load").catch(() => {});
+    const block = await detectBlock(page);
+    if (block.blocked) throw new Error(`blocked: ${block.kind}`);
+    const r = await stagehand.extract(
+      `Report the current ${watch.metric || "value"} on this page. Use only what is visible.`,
+      schema,
+      { page, timeout: 45000, ignoreLocators: [page.locator("nav")] },
+    );
+    return shapeObservation(watch, r.data ?? {}, url);
+  });
+}
+
 async function observeUrl(watch, url, deadline) {
   const build = OBSERVE_SCHEMAS[watch.kind];
   if (!build) throw new Error(`unknown watch kind ${watch.kind}`);
   const schema = build(watch.metric || "value");
+
+  // A watch already known to need a browser skips straight to it rather than
+  // paying for a fetch that returned nothing last time.
+  if (watch.source?.needsBrowser) return observeViaBrowser(watch, url);
 
   const raw = await withTimeout(
     browserbase.fetch({
@@ -1683,25 +1743,24 @@ async function observeUrl(watch, url, deadline) {
   // page" and is indistinguishable from a site that blocked us. The existing
   // retail lookup already unwraps it this way (enrichPicksWithRetail).
   const d = raw?.content && typeof raw.content === "object" ? raw.content : {};
-  const at = Date.now();
+  const obs = shapeObservation(watch, d, url);
 
-  if (watch.kind === "numeric") {
-    const value = parseAmount(d.valueText);
-    return {
-      url, at, value,
-      raw: d.valueText ?? null,
-      unit: parseUnit(d.valueText) ?? watch.condition?.unit ?? null,
-      title: d.title ?? null,
-      state: labelState(d.soldOutText),
-    };
+  // Nothing found is the signature of a client-rendered page: the fetch
+  // succeeds and returns an empty document. Escalate once rather than
+  // reporting a readable page as unreadable.
+  if (observationIsEmpty(watch, obs)) {
+    console.log(`[watch] ${hostOf(url)} gave nothing to fetch; trying a browser`);
+    try {
+      const viaBrowser = await observeViaBrowser(watch, url);
+      if (!observationIsEmpty(watch, viaBrowser)) {
+        viaBrowser.neededBrowser = true;
+        return viaBrowser;
+      }
+    } catch (err) {
+      console.warn(`[watch] browser read of ${hostOf(url)} failed: ${clamp(err.message, 60)}`);
+    }
   }
-  if (watch.kind === "state") {
-    return { url, at, state: labelState(d.stateText), raw: d.stateText ?? null, title: d.title ?? null };
-  }
-  if (watch.kind === "presence") {
-    return { url, at, present: Boolean(d.found), evidence: d.evidence ?? null };
-  }
-  return { url, at, deadlineAt: parseDateish(d.dateText), raw: d.dateText ?? null, title: d.title ?? null };
+  return obs;
 }
 
 /**
@@ -2606,6 +2665,13 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
 
   patch.failCount = 0;
   if (obs) patch.state = obs;
+  // Learned once, reused forever: a page that only renders under JavaScript
+  // will do so on every tick, and paying for a dead fetch first each time is
+  // pure waste.
+  if (obs?.neededBrowser && !w.source?.needsBrowser) {
+    patch.source = { ...w.source, needsBrowser: true };
+    console.log(`[watch ${w.id}] marked as needing a browser`);
+  }
   if (verdict.nextBaseline) {
     patch.baseline = verdict.nextBaseline;
     if (w.condition?.op === "drops_pct" || w.condition?.op === "rises_pct") {
@@ -2722,6 +2788,7 @@ async function createWatchTurn(sender, request, mem) {
   }
 
   const patch = { state: obs, lastCheckedAt: Date.now(), nextCheckAt: Date.now() + jitter(created.schedule.everyMs) };
+  if (obs.neededBrowser) patch.source = { ...created.source, needsBrowser: true };
   // A relative condition needs something to be relative to.
   if ((created.condition.op === "drops_pct" || created.condition.op === "rises_pct") && obs.value != null) {
     patch.condition = { ...created.condition, baselineValue: obs.value };
@@ -2830,7 +2897,19 @@ async function manageWatchTurn(sender, request, mem, send) {
     if (out.notified) return null; // checkWatch already texted them
     if (out.failed) return `I couldn't read that page just now. I'll keep trying on schedule.`;
     const fresh = watches.get(target.id);
-    return `Checked ${target.label} - ${describeFire(fresh, fresh.state) || "no change"}.`;
+    // Reported plainly rather than through describeFire, which is phrased for
+    // an alert: on a `changes` watch it would say "changed to USD 253.71" about
+    // a value that did not move.
+    const s = fresh.state ?? {};
+    const reading =
+      s.value != null ? `${s.unit ? s.unit + " " : ""}${s.value}`
+      : s.state && s.state !== "unknown" ? String(s.state).replace(/_/g, " ")
+      : s.present != null ? (s.present ? "showing" : "not showing")
+      : s.deadlineAt ? new Date(s.deadlineAt).toDateString()
+      : null;
+    return reading
+      ? `${target.label} is ${reading} right now - nothing that meets your alert yet.`
+      : `Checked ${target.label}, but I couldn't read a value off it.`;
   }
   return `You're watching:\n${mine.map((w) => `- ${watchLine(w)}`).join("\n")}`;
 }
