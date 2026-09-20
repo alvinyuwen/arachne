@@ -460,6 +460,105 @@ async function llmJSON({ system, user, schema, schemaName, model, deadline, maxR
 }
 
 /* ------------------------------------------------------------------ */
+/* Images                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What the model may report about a photo.
+ *
+ * Observations, not conclusions - the same split the watch pipeline uses. It
+ * says what it can see; code turns that into a search. `confident` is asked for
+ * explicitly so an uncertain identification can be worded as a guess rather
+ * than stated as fact.
+ */
+const ImageSchema = z.object({
+  subject: z
+    .string()
+    .describe('What this is, as you would say it to someone: "a black mechanical keyboard", "a hiking boot"'),
+  brandGuess: z
+    .string()
+    .nullable()
+    .describe("Brand and model if you can tell, including from any visible logo. Null if you cannot."),
+  distinguishing: z
+    .array(z.string())
+    .describe("Up to 4 details that would narrow a search: colour, material, layout, size, distinctive features"),
+  readableText: z
+    .string()
+    .nullable()
+    .describe("Any text legible in the image, verbatim - a label, a model number, a sign. Null if none."),
+  confident: z.boolean().describe("True only if you are fairly sure what this specific thing is"),
+});
+
+const IMAGE_SYSTEM = `You describe one photo so someone else can search the web for it.
+
+Report only what is visible. Do not guess a brand from vibes - name one only if a logo,
+a label or a distinctive design makes it identifiable, and set confident accordingly.
+
+distinguishing is for terms that would narrow a search: "walnut case", "75% layout",
+"knob top right". Not adjectives like "nice" or "modern".
+
+If the photo is of a screen or a document, readableText matters more than anything else.`;
+
+/**
+ * Look at one image and describe it.
+ *
+ * Sends the URL and lets OpenAI fetch it, which works because Linq's CDN links
+ * are public. Some hosts refuse that fetcher though - Wikimedia does, with
+ * "Error while downloading file" - so a failure falls back to downloading the
+ * bytes here and inlining them. Worth the extra path: the alternative is an
+ * image the user can see and the agent cannot, for reasons neither can inspect.
+ */
+async function describeImage(url, caption, deadline) {
+  const instruction = caption
+    ? `Describe this image. The person sent it with the message: "${clamp(caption, 200)}"`
+    : "Describe this image.";
+
+  const ask = (imageUrl) =>
+    llmJSON({
+      system: IMAGE_SYSTEM,
+      user: [
+        { type: "text", text: instruction },
+        { type: "image_url", image_url: { url: imageUrl } },
+      ],
+      schema: ImageSchema,
+      schemaName: "image",
+      deadline,
+    });
+
+  try {
+    return await ask(url);
+  } catch (err) {
+    const detail = err.response?.data?.error?.message ?? err.message ?? "";
+    if (!/download|fetch|invalid_image|timeout/i.test(detail)) throw err;
+    console.warn(`[image] ${hostOf(url)} refused the fetcher; inlining instead`);
+    const { data, headers } = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 20000,
+      maxContentLength: 8 * 1024 * 1024,
+    });
+    const mime = headers["content-type"] ?? "image/jpeg";
+    return ask(`data:${mime};base64,${Buffer.from(data).toString("base64")}`);
+  }
+}
+
+/** Fold what was seen into the sentence the rest of the pipeline reads. */
+function textFromImage(description, caption) {
+  const bits = [
+    description.brandGuess || description.subject,
+    ...(description.distinguishing ?? []).slice(0, 4),
+  ].filter(Boolean);
+  if (description.readableText) bits.push(`text on it: "${clamp(description.readableText, 80)}"`);
+  const seen = bits.join(", ");
+
+  // A caption is the actual request; the photo is its subject. Without one the
+  // request is implied, and "what is this and where do I get it" is what people
+  // mean by sending a picture of a thing.
+  return caption
+    ? `${caption} (the photo shows: ${seen})`
+    : `Identify this and find where to buy it: ${seen}`;
+}
+
+/* ------------------------------------------------------------------ */
 /* Webhook signature verification (Standard Webhooks)                  */
 /* ------------------------------------------------------------------ */
 
@@ -587,9 +686,20 @@ function parseWebhook(body = {}) {
     body.text ||
     "";
 
+  // Attachments arrive as parts too, and were being filtered out one line above
+  // - the text filter dropped them, then the webhook dropped the whole message
+  // for having no text. An image sent on its own produced total silence.
+  const media = Array.isArray(d?.parts)
+    ? d.parts
+        .filter((p) => p?.type === "media" && typeof p.url === "string" && /^https:\/\//i.test(p.url))
+        .map((p) => ({ url: p.url, contentType: p.content_type ?? p.contentType ?? null }))
+        .slice(0, 4)
+    : [];
+
   return {
     senderNumber,
     messageText: String(messageText).trim(),
+    media,
     eventType: body.event_type ?? "message.received",
     direction: d?.direction,
   };
@@ -3357,8 +3467,29 @@ function shouldAck(taskType, tier) {
  * second message sees the first one's answer in history instead of routing
  * against stale state.
  */
-async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnly = false } = {}) {
-  const { text: safeText, hadSecret } = redactSecrets(messageText);
+async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnly = false, media = [] } = {}) {
+  let { text: safeText, hadSecret } = redactSecrets(messageText);
+
+  // A photo is resolved to words before anything else looks at the turn, so the
+  // router, the classifier, both tiers and the watch path all keep receiving
+  // plain text and need to know nothing about images.
+  if (media.length) {
+    try {
+      const seen = await describeImage(media[0].url, safeText, new Deadline(45000));
+      safeText = textFromImage(seen, safeText);
+      console.log(`[image] ${seen.confident ? "identified" : "guessed"}: ${clamp(seen.brandGuess || seen.subject, 60)}`);
+    } catch (err) {
+      console.warn(`[image] could not read it: ${clamp(err.message, 80)}`);
+      if (!safeText) {
+        // No caption and no description leaves nothing to act on. Saying so is
+        // the whole point - silence is what made this look broken.
+        const note = "I couldn't open that image. Send it again, or tell me what it is and I'll look it up?";
+        recordTurn(senderNumber, "assistant", note, "error");
+        await send(senderNumber, [{ type: "text", value: note }]);
+        return;
+      }
+    }
+  }
 
   // Deterministic, and before any model call: if a credential came through,
   // the raw text must not reach the router, the store, or OpenAI.
@@ -3704,6 +3835,9 @@ app.post("/debug/turn", async (req, res) => {
   try {
     const route = await handleTurn(from, String(req.body?.text ?? ""), {
       routeOnly: Boolean(req.body?.routeOnly),
+      media: Array.isArray(req.body?.media)
+        ? req.body.media.map((m) => (typeof m === "string" ? { url: m } : m))
+        : [],
       send: async (_to, parts) => {
         sent.push(parts);
         return { stubbed: true };
@@ -3795,7 +3929,7 @@ app.post("/webhook/linq", (req, res) => {
     return res.status(401).json({ error: "invalid signature" });
   }
 
-  const { senderNumber, messageText, direction } = parseWebhook(req.body);
+  const { senderNumber, messageText, media, direction } = parseWebhook(req.body);
   // Redacted before it reaches stdout: the log was the first of four copies a
   // texted credential would otherwise end up in.
   console.log(
@@ -3807,15 +3941,21 @@ app.post("/webhook/linq", (req, res) => {
   res.status(200).json({ received: true });
 
   if (direction === "outbound") return;
-  if (!senderNumber || !messageText) {
-    console.warn("[webhook] ignored: missing sender or text");
+  // An image with no caption is a complete request, not an empty message.
+  if (!senderNumber || (!messageText && !media.length)) {
+    console.warn("[webhook] ignored: missing sender, text and media");
     return;
   }
 
   // Linq retries a webhook it believes failed. That was harmless when every
   // message was independent; with conversation state a retry would append a
   // duplicate turn and spend the rate budget twice.
-  const eventId = req.get("webhook-id") || `${senderNumber}|${messageText}|${Math.floor(Date.now() / 60000)}`;
+  // The media URL is part of the identity: two captionless photos sent in the
+  // same minute are different messages, and without it the second is discarded
+  // as a duplicate delivery.
+  const eventId =
+    req.get("webhook-id") ||
+    `${senderNumber}|${messageText}|${media[0]?.url ?? ""}|${Math.floor(Date.now() / 60000)}`;
   if (seenWebhooks.has(eventId)) {
     console.log("[webhook] duplicate delivery ignored");
     return;
@@ -3840,7 +3980,7 @@ app.post("/webhook/linq", (req, res) => {
   if (senderQueues.has(senderNumber) && ACK_MODE !== "never") {
     sendText(senderNumber, "Got it - I'll get to this right after the one I'm on.");
   }
-  enqueueForSender(senderNumber, () => handleTurn(senderNumber, messageText)).catch((err) =>
+  enqueueForSender(senderNumber, () => handleTurn(senderNumber, messageText, { media })).catch((err) =>
     console.error("[webhook] unhandled:", err),
   );
 });

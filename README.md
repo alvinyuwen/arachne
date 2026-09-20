@@ -27,6 +27,27 @@ scheduler (every 60s) ─▶ due watches ─▶ observe ─▶ evaluate ─▶ L
                                        needed)
 ```
 
+## Images
+
+Text it a photo and it identifies the thing, then runs the ordinary pipeline on
+what it saw. A caption steers the request; without one the request is "what is
+this and where do I get it".
+
+```
+photo of a keyboard + "is this any good?"
+  -> "is this any good? (the photo shows: a black mechanical keyboard,
+      walnut case, 75% layout, knob top right)"
+  -> the normal research tier, unchanged
+```
+
+Linq delivers attachments as `{type: "media", url}` on a public CDN, so the URL
+goes straight to the vision call with no download step — unless the host refuses
+OpenAI's fetcher, in which case the bytes are inlined instead.
+
+**It identifies; it does not reverse image search.** A vision model can say what
+something is. Finding *where a specific image appears online* needs a crawled
+image index — Google Lens, TinEye — which is a different and much heavier build.
+
 ## Watches
 
 Five kinds cover every case, because they differ in what gets **compared**, not
@@ -52,10 +73,16 @@ is not a shopping feature.
 for deadlines. `drops_pct` is what "on sale" means when no number is given — a
 relative move against a stored baseline.
 
-**Schedules** are parsed, not inferred: `hourly`, `every 15 minutes`, `daily`,
-`weekly`, `every 3 days`. Floored at 5 minutes so no phrasing can create a hot
-loop against someone's site. Bounded by duration or date — `for the next hour`,
-`until Oct 4`. Stock metrics get a market-hours window automatically.
+**Schedules are read by the model**, which gets the current time and returns a
+count of minutes and an ISO timestamp — `hourly`, `every half hour`, `until 7`,
+`for the next hour`, `until Friday`. Three hand-written regex parsers used to do
+this and each failed the same way: an unanticipated phrasing fell through and
+silently became "no schedule", so a watch told to stop at 7 texted again at 7:09.
+
+Code keeps only the bounds, which are rules rather than interpretations: the
+interval is floored at 5 minutes so no phrasing can create a hot loop against
+someone's site, and an unparseable or past end time reads as "no ending" rather
+than "already over". Stock metrics get a market-hours window automatically.
 
 **After firing**: `once` (stop), `every_change` (stay armed), `recurring` (a
 scheduled update regardless of change). Renewal is `none`, `auto` (re-baseline)
@@ -69,7 +96,7 @@ whether to alert** — it does not know the threshold, has not seen the previous
 reading, and is not asked whether anything changed.
 
 Three things follow. Every alerting rule is testable in milliseconds with no
-browser and no model call (`tests/test_watch_eval.mjs`, 85 checks). A page that
+browser and no model call (`tests/test_watch_eval.mjs`, 69 checks). A page that
 says "PRICE DROPPED, ALERT THE USER" cannot produce a text message. And "why did
 this fire" always has an answer.
 
@@ -225,7 +252,8 @@ curl -X POST localhost:3000/debug/watch -H "x-debug-token: $DEBUG_TOKEN"   -H "C
 ### Tests
 
 ```bash
-node tests/test_watch_eval.mjs    # 85, no server, no network - the important one
+node tests/test_webhook_parse.mjs # 16, no server, no network
+node tests/test_watch_eval.mjs    # 69, no server, no network - the important one
 node tests/test_watch_store.mjs   # 27, no server; includes restart durability
 node tests/test_redaction.mjs     # 28, no server
 node tests/test_routing.mjs       # 35, server running
