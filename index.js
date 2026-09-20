@@ -1324,7 +1324,7 @@ async function runChat({ text, mem, deadline }) {
 
 const ClassificationSchema = z.object({
   taskType: z
-    .enum(["product_research", "factual_lookup", "analysis", "social_media", "interactive_browse"])
+    .enum(["product_research", "factual_lookup", "analysis", "plan", "social_media", "interactive_browse"])
     .describe("Which playbook handles this request"),
   tier: z.enum(["research", "browser"]).describe("research = read public pages; browser = interact with a live page"),
   restatedGoal: z.string().describe("One sentence restating what the user wants"),
@@ -1370,6 +1370,13 @@ TASK TYPES
        "what are people saying about the new iPhone"
   Pick this over factual_lookup whenever the answer is longer than a couple of sentences,
   and over social_media whenever the subject is a TOPIC rather than an account.
+- plan: they want something laid out in ORDER to follow - a trip itinerary, a schedule, a
+  route, a study or training plan, a menu for the week. The giveaway is that the answer has
+  steps or days, and shuffling them would break it. "plan", "itinerary", "schedule",
+  "what should I do on", "walk me through" all land here.
+  e.g. "give me a 5-day Paris itinerary, mostly walkable" /
+       "plan a full day in Kyoto with kids"
+  Pick this over analysis whenever the answer is a sequence rather than a view.
 - social_media: what a specific PERSON or BRAND has publicly posted or shown. About an
   account, not about a subject being discussed.
   e.g. "what has @nasa posted lately" / "find the official Patagonia Instagram"
@@ -1545,6 +1552,35 @@ const AnalysisSchema = z.object({
   caveats: z.array(z.string()).describe("What the sources could not establish"),
 });
 
+/**
+ * "Plan me a trip." An ordered thing to follow, not commentary.
+ *
+ * Without this a request for a five-day Paris itinerary landed on `analysis`,
+ * whose shape is consensus / disagreement / my read - so it returned opinions
+ * about Paris travel where the ask was day one, day two, day three. A plan has
+ * an order that carries meaning, which no other playbook here can express.
+ */
+const PlanSchema = z.object({
+  title: z.string().describe('What this plan is, short: "5 days in Paris, mostly on foot"'),
+  overview: z.string().describe("One or two sentences on the shape of the plan and any assumption you made"),
+  segments: z
+    .array(
+      z.object({
+        label: z.string().describe('The step or period: "Day 1", "Morning", "Week 2"'),
+        headline: z.string().describe("What this segment is for, a few words"),
+        items: z
+          .array(z.string())
+          .describe("2-5 concrete things, each one complete and under 30 words. Real names, not categories."),
+        sourceIndex: z.number().int(),
+      }),
+    )
+    .describe("The plan in order. Order carries meaning here - do not shuffle."),
+  practical: z
+    .array(z.object({ label: z.string(), value: z.string(), sourceIndex: z.number().int() }))
+    .describe("Costs, booking notes, how to get around - the things needed to act on it"),
+  caveats: z.array(z.string()).describe("What could not be confirmed from the sources"),
+});
+
 const SocialSchema = z.object({
   subject: z.string().describe("Who or what the request was about"),
   publicFindings: z.array(
@@ -1628,6 +1664,50 @@ ${SOURCE_RULES}`,
       ).slice(0, 2);
       if (urls.length) lines.push("", ...urls);
       if (data.confidence === "low") lines.push("", "Low confidence - worth double checking.");
+      return lines.join("\n").trim();
+    },
+  },
+
+  plan: {
+    schema: PlanSchema,
+    synthesisSystem: () =>
+      "You build a plan someone will follow, from the numbered sources.\n\n" +
+      "Order is the point. Each segment is a step or a period, in the order it happens, and " +
+      "the items inside it are concrete: real places, real names, real times where the " +
+      "sources give them. Not \"visit a museum\" but which museum.\n\n" +
+      "practical is what someone needs to actually do it - what it costs, what must be booked " +
+      "ahead, how to get between things.\n\n" +
+      "If the sources do not cover part of the request, say so in caveats rather than " +
+      "inventing a segment.\n" + SOURCE_RULES,
+    browserObjective: (c) => c.restatedGoal,
+    extractHint: "",
+    render: (data, c, corpus) => {
+      const lines = [stripMarkdownSoft(data.title), ""];
+      if (data.overview) lines.push(stripMarkdownSoft(data.overview), "");
+
+      for (const seg of (data.segments ?? []).slice(0, 7)) {
+        lines.push(`${stripMarkdown(seg.label)} — ${clamp(stripMarkdown(seg.headline), 70)}`);
+        for (const it of (seg.items ?? []).slice(0, 5)) {
+          lines.push(`  · ${clamp(stripMarkdown(it), 160)}`);
+        }
+        lines.push("");
+      }
+
+      if (data.practical?.length) {
+        lines.push("Practical:");
+        for (const p of data.practical.slice(0, 4)) {
+          lines.push(`· ${clamp(stripMarkdown(p.label), 34)}: ${clamp(stripMarkdown(p.value), 120)}`);
+        }
+        lines.push("");
+      }
+
+      const urls = uniq(
+        [...(data.segments ?? []), ...(data.practical ?? [])]
+          .map((x) => corpus?.[x.sourceIndex]?.url)
+          .filter(Boolean),
+      ).slice(0, 3);
+      if (urls.length) lines.push("Sources:", ...urls);
+      if (data.caveats?.length) lines.push("", clamp(stripMarkdown(data.caveats[0]), 160));
       return lines.join("\n").trim();
     },
   },
@@ -2430,7 +2510,7 @@ function validateSourceIndexes(data, corpus, classification) {
   // The analysis playbook cites from two arrays. Same rule as everywhere else:
   // a citation that does not point at a real fetched source is dropped rather
   // than rendered, so a link can never be invented.
-  for (const key of ["consensus", "disagreement"]) {
+  for (const key of ["consensus", "disagreement", "segments", "practical"]) {
     if (Array.isArray(data[key])) data[key] = data[key].filter((p) => inRange(p.sourceIndex));
   }
   return data;
@@ -2448,6 +2528,38 @@ const DecisionSchema = z.object({
   navigateUrl: z.string().nullable().describe("Absolute URL, for action=navigate"),
   stopReason: z.string().nullable(),
 });
+
+/**
+ * Start a Browserbase session, with proxies if the plan allows them.
+ *
+ * Whether proxies are available is a property of the account, not of the
+ * request, so the first refusal is remembered rather than retried on every
+ * session. Residential proxies matter because sites serve different pages to a
+ * bare datacentre IP than to a phone.
+ *
+ * This was deleted along with the sign-in machinery and its call site below was
+ * left behind, so every browser session threw "launchSession is not defined" -
+ * screenshots, interactive_browse, and the escalation that reads JavaScript
+ * pages for a watch. `node --check` cannot see a ReferenceError and the only
+ * suites that would have caught it need a live session, so it shipped.
+ */
+let proxySessions = BROWSER_PROXIES !== "false";
+
+async function launchSession(extra = {}) {
+  const base = { apiKey: BROWSERBASE_API_KEY, projectId: BROWSERBASE_PROJECT_ID, ...extra };
+  if (proxySessions) {
+    try {
+      return await browserbase.launch({ ...base, proxies: true });
+    } catch (err) {
+      proxySessions = false;
+      console.warn(
+        `[browser] session proxies unavailable on this plan (${clamp(err.message, 60)}); ` +
+          "continuing without them - fetch still uses them",
+      );
+    }
+  }
+  return browserbase.launch(base);
+}
 
 async function withSession(fn) {
   return browserSlot(async () => {
