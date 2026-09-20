@@ -86,12 +86,23 @@ export function openStore(file) {
   db.exec("PRAGMA busy_timeout = 4000");
   db.exec(SCHEMA);
 
+  // Migrations. CREATE TABLE IF NOT EXISTS leaves an existing table alone, so
+  // a new column has to be added explicitly - and has to tolerate already
+  // being there, because this runs on every open.
+  for (const [column, decl] of [["brief", "TEXT"]]) {
+    try {
+      db.exec(`ALTER TABLE watches ADD COLUMN ${column} ${decl}`);
+    } catch {
+      /* already present */
+    }
+  }
+
   const stmt = {
     insert: db.prepare(`INSERT INTO watches
-      (id, sender, label, kind, metric, source, condition, schedule, lifecycle,
+      (id, sender, label, kind, metric, brief, source, condition, schedule, lifecycle,
        state, baseline, status, next_check_at, last_checked_at, last_notified_at,
        fail_count, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
     byId: db.prepare(`SELECT * FROM watches WHERE id = ?`),
     bySender: db.prepare(
       `SELECT * FROM watches WHERE sender = ? AND status IN ('active','awaiting_renewal','paused')
@@ -117,6 +128,7 @@ export function openStore(file) {
       w.label,
       w.kind,
       w.metric ?? null,
+      w.brief ?? null,
       JSON.stringify(w.source ?? {}),
       JSON.stringify(w.condition ?? {}),
       JSON.stringify(w.schedule ?? {}),
@@ -145,7 +157,7 @@ export function openStore(file) {
    * else.
    */
   const COLUMNS = {
-    label: "label", kind: "kind", metric: "metric", status: "status",
+    label: "label", kind: "kind", metric: "metric", brief: "brief", status: "status",
     source: "source", condition: "condition", schedule: "schedule",
     lifecycle: "lifecycle", state: "state", baseline: "baseline",
     nextCheckAt: "next_check_at", lastCheckedAt: "last_checked_at",

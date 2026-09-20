@@ -1950,15 +1950,26 @@ const OBSERVE_SCHEMAS = {
         .describe(`The ${metric} date as written on the page, e.g. "October 4, 2025" or "Oct 4". Null if not shown.`),
       title: z.string().nullable().describe("What this page is about, a few words"),
     }),
-  digest: (metric) =>
+  // The digest schema is the one place the model is asked to REASON rather than
+  // only report, and it is legitimate here: a digest has no threshold, so there
+  // is no decision for code to own. "Model extracts, code decides" governs
+  // alerting, and a digest does not alert - the answer IS the message.
+  //
+  // Without this the standing request never reached the model. Someone asked
+  // for buy and sell calls against a 200,000 budget, willing to take risk, and
+  // got a list of today's top gainers - because the model was only ever asked
+  // "what does this page say about Tokyo Stock Exchange actions".
+  digest: (metric, brief) =>
     z.object({
       summary: z
         .string()
         .nullable()
         .describe(
-          `The current ${metric}, stated in one or two short lines as you would text it to someone. ` +
-            "Concrete values, not description: \"18C, cloudy, rain after 4pm\" rather than \"the weather is shown\". " +
-            "Null if the page does not have it.",
+          `Every concrete fact on this page bearing on ${metric}` +
+            (brief ? `, for someone who asked: "${clamp(brief, 200)}"` : "") +
+            ". Names, numbers, percentages, times - as many as are actually shown, densely. " +
+            "Do NOT describe the page or say what it tracks; report what it says. " +
+            "Do not draw conclusions, that happens elsewhere. Null if the page is unusable.",
         ),
       title: z.string().nullable().describe("What this page is about, a few words"),
     }),
@@ -2056,7 +2067,7 @@ function observationIsEmpty(watch, obs) {
  * empty.
  */
 async function observeViaBrowser(watch, url) {
-  const schema = OBSERVE_SCHEMAS[watch.kind](watch.metric || "value");
+  const schema = OBSERVE_SCHEMAS[watch.kind](watch.metric || "value", watch.brief);
   return withSession(async ({ browser, stagehand }) => {
     const page = await browser.context.newPage(url);
     await page.waitForLoadState("load").catch(() => {});
@@ -2074,7 +2085,7 @@ async function observeViaBrowser(watch, url) {
 async function observeUrl(watch, url, deadline, { allowBrowser = true } = {}) {
   const build = OBSERVE_SCHEMAS[watch.kind];
   if (!build) throw new Error(`unknown watch kind ${watch.kind}`);
-  const schema = build(watch.metric || "value");
+  const schema = build(watch.metric || "value", watch.brief);
 
   // A watch already known to need a browser skips straight to it rather than
   // paying for a fetch that returned nothing last time.
@@ -2662,7 +2673,7 @@ function shapeFallback(taskType, summary, finalUrl, history = []) {
 const watches = openStore(WATCH_DB);
 
 /** Build a stored watch from what the model pulled out of the message. */
-function watchFromSpec(sender, spec, mem) {
+function watchFromSpec(sender, spec, mem, request = "") {
   const urls = (spec.urls ?? []).filter((u) => /^https?:\/\//i.test(u)).slice(0, 4);
 
   // "watch this" after a search means the thing just found. lastTask already
@@ -2682,6 +2693,10 @@ function watchFromSpec(sender, spec, mem) {
     label: clamp(stripMarkdown(spec.label || spec.metric || "a page"), 80),
     kind: spec.kind,
     metric: clamp(stripMarkdown(spec.metric || ""), 60) || null,
+    // The whole request, kept so a digest can answer what was actually asked
+    // rather than only reporting the number. label and metric are both short by
+    // design - neither carries "with a budget of 200000, tell me what to buy".
+    brief: clamp(stripMarkdownSoft(request || ""), 400) || null,
     source: {
       mode: urls.length ? "pinned" : "hunting",
       urls,
@@ -2807,6 +2822,59 @@ function watchLine(w) {
   return `${w.label}: ${cond}, ${fmtEvery(w.schedule?.everyMs ?? DAY)}${last}${paused}`;
 }
 
+/**
+ * Turn what was scraped into what was asked for.
+ *
+ * The second of two passes, and the reason they are two. browserbase.fetch with
+ * a JSON schema is an EXTRACTION api - it pulls named fields off a page, and it
+ * is good at that. Asking it to also reason produced exactly what you would
+ * expect: "The provided page tracks market sector performance..." - a
+ * description of the page, when the request was which stocks to buy with a
+ * 200,000 budget and what actions to take.
+ *
+ * So the scrape stays an extraction and this pass does the thinking, over facts
+ * the scrape grounded. Each needs the other: without the extraction this would
+ * be inventing numbers, and without this the extraction never answers the
+ * question.
+ *
+ * Digests only. A threshold watch has its decision made in code, and that is
+ * the one thing a model must not be handed.
+ */
+async function answerFromObservation(watch, obs, deadline) {
+  const facts = obs?.summary;
+  if (!facts) return null;
+  if (!watch.brief) return facts;
+
+  try {
+    const reply = await llmText({
+      system:
+        "You are answering a standing request by text message. You are given what was just " +
+        "read off a live page, and the request it was set up to answer.\n\n" +
+        "Answer the request using those facts. Lead with the concrete numbers, then say what " +
+        "they mean for what was asked - if they asked what to do, say what to do and why.\n\n" +
+        "Plain text for a phone: no markdown, no bullet characters, a few short lines.\n\n" +
+        "Be straight about what you are inferring. The facts came from one page at one moment; " +
+        "anything past them is your reading, and where the request asks for more than the page " +
+        "can support, say which part is a judgement rather than dressing it as fact. Never " +
+        "imply an outcome is assured.",
+      messages: [
+        {
+          role: "user",
+          content: `THE STANDING REQUEST:\n${watch.brief}\n\nJUST READ FROM THE PAGE:\n${facts}`,
+        },
+      ],
+      deadline: deadline ?? new Deadline(30000),
+      maxTokens: 450,
+    });
+    return clamp(stripMarkdownSoft(reply), 900) || facts;
+  } catch (err) {
+    // The bare reading is still worth sending - better than silence, and better
+    // than pretending the reasoning happened.
+    console.warn(`[watch] could not reason over the reading: ${clamp(err.message, 60)}`);
+    return facts;
+  }
+}
+
 /** The alert itself. Short, because it arrives on a phone with no context. */
 function notificationText(w, obs, reason) {
   // A digest is the thing itself, not an alert about a thing. "Update: weather
@@ -2923,8 +2991,13 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
     return { notified: false, reason: "held for quiet hours" };
   }
 
+  // The second pass. The extraction grounded the facts; this turns them into
+  // the answer the person actually asked for.
+  const reason =
+    w.kind === "digest" ? (await answerFromObservation(w, obs)) ?? verdict.reason : verdict.reason;
+
   const delivered = await send(w.sender, [
-    { type: "text", value: notificationText(w, obs, verdict.reason) },
+    { type: "text", value: notificationText(w, obs, reason) },
   ]);
   if (!delivered) {
     // Nobody is waiting on this path, so a failed send must not be recorded as
@@ -2993,7 +3066,7 @@ async function createWatchTurn(sender, request, mem) {
     return "I couldn't work out what to watch there - what page, and what should make me text you?";
   }
 
-  const draft = watchFromSpec(sender, spec, mem);
+  const draft = watchFromSpec(sender, spec, mem, request);
   if (!draft.source.urls.length && !draft.source.query) {
     return `What should I watch for "${draft.label}"? Send me the link, or tell me what to search for.`;
   }
@@ -3020,7 +3093,10 @@ async function createWatchTurn(sender, request, mem) {
   watches.update(created.id, patch);
 
   const verdict = evaluate({ ...created, condition: patch.condition ?? created.condition }, null, obs);
-  const now = describeFire({ ...created, condition: patch.condition ?? created.condition }, obs);
+  const now =
+    created.kind === "digest"
+      ? (await answerFromObservation(created, obs)) ?? ""
+      : describeFire({ ...created, condition: patch.condition ?? created.condition }, obs);
   const until = created.lifecycle.expiresAt
     ? ` until ${new Date(created.lifecycle.expiresAt)
         .toLocaleString("en-CA", { hour: "numeric", minute: "2-digit", month: "short", day: "numeric" })

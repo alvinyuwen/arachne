@@ -93,6 +93,33 @@ later. Not immediately: "keep watching" after a renewal prompt, and "actually,
 resume that one", both need the row to still exist. One `awaiting_renewal` is
 never purged at all, because it is waiting on a person rather than finished.
 
+### Two passes that build on each other
+
+A digest runs the scrape and the model in sequence, each doing the thing it is
+good at:
+
+```
+scrape  browserbase.fetch + a JSON schema  ->  dense facts off the live page
+model   the facts + the standing request   ->  the answer that was asked for
+```
+
+They are separate because `fetch` with a schema is an **extraction** API. Asked
+to reason as well it returns a description of the page - "The provided page
+tracks market sector performance..." - when the request was which stocks to buy
+with a 200,000 budget. Split apart, the extraction grounds real numbers and the
+model answers the question:
+
+> Toronto now: 53°F, feels like 50°F. NNE wind 8 mph, humidity 84%.
+> Today: high 71°F, low 50°F. Rain chance 0%.
+> **Bring a light jacket, especially if you're out early. No umbrella needed.**
+
+Neither half works alone. Without the extraction the model invents numbers;
+without the model the extraction never answers.
+
+The whole request is stored on the watch as `brief`, because `label` and
+`metric` are both short by design and neither carries "with a budget of 200000,
+tell me what to buy".
+
 ### The model extracts, code decides
 
 The model returns a typed observation. A pure function in `watch.js` compares it
