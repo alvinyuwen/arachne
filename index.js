@@ -1499,7 +1499,12 @@ const AnalysisSchema = z.object({
   consensus: z
     .array(
       z.object({
-        point: z.string().describe("A view that recurs across sources, stated concretely"),
+        point: z
+          .string()
+          .describe(
+            "A view that recurs across sources, stated concretely. One complete sentence, " +
+              "under 40 words - it is rendered on a phone and a long one gets cut mid-thought.",
+          ),
         sourceIndex: z.number().int(),
       }),
     )
@@ -1507,7 +1512,12 @@ const AnalysisSchema = z.object({
   disagreement: z
     .array(
       z.object({
-        point: z.string().describe("Where sources differ, and how"),
+        point: z
+          .string()
+          .describe(
+            "Where sources differ, and how. One complete sentence, under 40 words - it is " +
+              "rendered on a phone and a long one gets cut mid-thought.",
+          ),
         sourceIndex: z.number().int(),
       }),
     )
@@ -1630,14 +1640,14 @@ ${SOURCE_RULES}`,
       if (data.consensus?.length) {
         lines.push("What people are saying:");
         for (const p of data.consensus.slice(0, 4)) {
-          lines.push(`· ${clamp(stripMarkdown(p.point), 180)}`);
+          lines.push(`· ${clamp(stripMarkdown(p.point), 320)}`);
         }
         lines.push("");
       }
       if (data.disagreement?.length) {
         lines.push("Where they differ:");
         for (const p of data.disagreement.slice(0, 2)) {
-          lines.push(`· ${clamp(stripMarkdown(p.point), 180)}`);
+          lines.push(`· ${clamp(stripMarkdown(p.point), 320)}`);
         }
         lines.push("");
       }
