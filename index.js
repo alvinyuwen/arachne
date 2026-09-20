@@ -28,7 +28,7 @@ import { openStore } from "./store.js";
 import {
   parseAmount, parseUnit, evaluate, describe as describeFire,
   inWindow, deferPastQuietHours, jitter, backoffFor,
-  MIN_INTERVAL_MS, DEFAULT_INTERVAL_MS, HOUR, DAY,
+  DEFAULT_INTERVAL_MS, HOUR, DAY,
 } from "./watch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,7 +94,13 @@ const {
   // watching" after a renewal prompt, and "actually, resume that one", both
   // need the row to still be there.
   WATCH_RETAIN_MS = 86400000,
+  // The floor on how often a watch may check. 0 removes it, which is how the
+  // demo runs. Nothing spins even then: a watch cannot be checked more often
+  // than WATCH_TICK_MS looks for due work, so the tick rate is the real bound.
+  WATCH_MIN_INTERVAL_MS = 0,
 } = process.env;
+
+const WATCH_FLOOR_MS = Math.max(0, Number(WATCH_MIN_INTERVAL_MS) || 0);
 
 const TASK_TIMEOUT = Number(TASK_TIMEOUT_MS);
 const RESEARCH_BUDGET = Number(RESEARCH_BUDGET_MS);
@@ -201,6 +207,11 @@ function checkRateLimit(sender, bucket = "task", limit = Number(RATE_LIMIT_PER_H
   // Browserbase session plus fetches plus synthesis, a chat turn is two short
   // completions. Charging "thanks" against the research budget is what makes
   // the agent feel stingy for no saving.
+  // 0 turns the budget off entirely. Set that way for the demo: the caps exist
+  // to stop a runaway loop spending someone's money, and during a demo the
+  // person spending it is standing right there watching.
+  if (!(limit > 0)) return { ok: true, remaining: Infinity };
+
   const key = `${bucket}:${sender}`;
   const now = Date.now();
   const hits = (rateWindows.get(key) ?? []).filter((t) => now - t < 3600000);
@@ -2780,7 +2791,7 @@ function normalizeSchedule(spec, fallbackMs) {
   const asked = Number(spec.everyMinutes);
   const stated = Number.isFinite(asked) && asked > 0;
   const everyMs = stated
-    ? Math.max(MIN_INTERVAL_MS, Math.round(asked * 60_000))
+    ? Math.max(WATCH_FLOOR_MS, Math.round(asked * 60_000))
     : Number(fallbackMs) || DEFAULT_INTERVAL_MS;
 
   // Jitter spreads watches that would otherwise fire together, but it has no
@@ -2988,8 +2999,9 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
   // overriding an explicit instruction. Exempt, and likewise for quiet hours:
   // someone who asked for updates through the night gets them.
   const recurring = w.lifecycle?.fireMode === "recurring";
+  const cooldown = Number(WATCH_NOTIFY_COOLDOWN_MS);
   const sinceLast = now - (w.lastNotifiedAt ?? 0);
-  if (!recurring && sinceLast < Number(WATCH_NOTIFY_COOLDOWN_MS)) {
+  if (!recurring && cooldown > 0 && sinceLast < cooldown) {
     patch.nextCheckAt = (w.lastNotifiedAt ?? now) + Number(WATCH_NOTIFY_COOLDOWN_MS);
     watches.update(w.id, patch);
     return { notified: false, reason: "within cooldown" };
@@ -3056,7 +3068,8 @@ async function checkWatch(w, { send = sendLinq, now = Date.now() } = {}) {
  * $74 would otherwise sit silent forever, since alerts fire on the transition.
  */
 async function createWatchTurn(sender, request, mem) {
-  if (watches.countActive(sender) >= Number(WATCH_MAX_PER_SENDER)) {
+  const maxWatches = Number(WATCH_MAX_PER_SENDER);
+  if (maxWatches > 0 && watches.countActive(sender) >= maxWatches) {
     return `You've got ${Number(WATCH_MAX_PER_SENDER)} watches running, which is my limit. Text me "what am I watching" and stop one to make room.`;
   }
 
