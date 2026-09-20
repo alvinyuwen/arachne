@@ -325,6 +325,28 @@ const SECRET_RE = new RegExp(
   "gi",
 );
 
+/**
+ * A request to be told something more than once.
+ *
+ * Narrow on purpose - it only has to catch an explicit repeat, because its job
+ * is to stop a scheduled request being answered once and forgotten. Anything
+ * vaguer is left to the router, which handles it correctly when the phrasing is
+ * a plain "let me know when...".
+ */
+const REPEAT_RE = new RegExp(
+  [
+    // "every 5 minutes", "every other day", "every half hour"
+    String.raw`\bevery\s+(?:\d+|other|few|half|couple)\b`,
+    // "every morning", "every hour"
+    String.raw`\bevery\s+(?:minute|min|hour|hr|day|morning|night|evening|week|month)\b`,
+    String.raw`\b(?:hourly|daily|nightly|weekly|monthly|periodically|repeatedly|constantly)\b`,
+    String.raw`\beach\s+(?:hour|day|morning|night|evening|week)\b`,
+    String.raw`\bkeep (?:me (?:posted|updated|informed)|updating me)\b`,
+    String.raw`\btwice (?:a|per) (?:day|hour|week)\b`,
+  ].join("|"),
+  "i",
+);
+
 /** Used to catch a clarifying question that drifted into asking for a secret. */
 const SECRET_ASK_RE =
   /\b(pass(word|code)|pwd|passphrase|pin|otp|2fa|mfa|one[- ]time code|verification code|security code|login (details|info|credentials)|credentials|cvv)\b/i;
@@ -977,9 +999,15 @@ choose chat.
 
 task vs watch is about WHEN they want the answer, not about the subject. "what's the price"
 is task; "tell me when the price drops" is watch. "find me one under $80" is task - they
-want it now; "let me know if one goes under $80" is watch - they want it later. A message
-that asks for something now AND to be told later is a task; the watch gets set up from the
-result.
+want it now; "let me know if one goes under $80" is watch - they want it later.
+
+A message asking for something now AND on a schedule is a WATCH. Setting one up reports the
+current reading while confirming it, so the one route answers both halves. "Tell me the
+weather at Waterloo and text me every 5 minutes" is a watch: routing it as a task answers
+once and drops the schedule, which was the substance of the request.
+
+Anything naming a repeat - "every N minutes/hours", "each morning", "hourly", "daily",
+"keep me posted" - is a watch however it is phrased.
 
 RESOLVING THE REQUEST
 For task, rewrite the message so it stands on its own. "cheaper?" after a power bank
@@ -1066,6 +1094,21 @@ LATEST MESSAGE: ${text}`,
   }
   if (route.mode === "task" && !route.resolvedRequest.trim()) {
     route.resolvedRequest = pending ? `${pending.originalText} ${text}` : text;
+  }
+
+  // A task cannot repeat itself. When someone asks to be texted on a cadence
+  // and this lands on `task`, the schedule is silently dropped - they get one
+  // answer and nothing more, having asked for the opposite. That happened to
+  // "tell me the weather at Waterloo and send me a text every 5 minutes": the
+  // router even said "and also scheduled follow-up" in its own reasoning and
+  // chose task anyway.
+  //
+  // Deterministic for the same reason the other backstops are: the prompt
+  // already told it this, and the prompt is what failed.
+  if (route.mode === "task" && REPEAT_RE.test(text)) {
+    console.log("[route] task -> watch: the message asks for a repeat");
+    route.mode = "watch";
+    route.resolvedRequest = route.resolvedRequest || text;
   }
   if (route.mode === "watch" || route.mode === "watch_manage") {
     // "Yes" on its own says nothing about what to watch. The task branch above
