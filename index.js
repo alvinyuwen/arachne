@@ -23,7 +23,6 @@ import express from "express";
 // working; if a future npm update breaks it, build schemas from stagehand's zod.
 import { z } from "zod";
 import { Stagehand, browserbase } from "@browserbasehq/stagehand";
-import Browserbase from "@browserbasehq/sdk";
 
 import { openStore } from "./store.js";
 import {
@@ -91,6 +90,10 @@ const {
   // but the session, the page load and the teardown do not, and an unbounded
   // one can spin.
   WATCH_BROWSER_TIMEOUT_MS = 90000,
+  // How long a finished watch is kept before being deleted. Not zero: "keep
+  // watching" after a renewal prompt, and "actually, resume that one", both
+  // need the row to still be there.
+  WATCH_RETAIN_MS = 86400000,
 } = process.env;
 
 const TASK_TIMEOUT = Number(TASK_TIMEOUT_MS);
@@ -746,7 +749,7 @@ const MEMORY_TTL = Number(MEMORY_TTL_MS);
 const CLARIFY_TTL = Number(CLARIFY_TTL_MS);
 
 function emptyConversation() {
-  return { turns: [], lastTask: null, pendingClarify: null, pendingLogin: null, updatedAt: Date.now() };
+  return { turns: [], lastTask: null, pendingClarify: null, updatedAt: Date.now() };
 }
 
 function getConversation(sender) {
@@ -2401,238 +2404,6 @@ function validateSourceIndexes(data, corpus, classification) {
   return data;
 }
 
-/* ------------------------------------------------------------------ */
-/* Authenticated browsing                                              */
-/* ------------------------------------------------------------------ */
-
-/**
- * Signing in without the agent ever holding a credential.
- *
- * The password problem is not storage, it is transmission: anything texted
- * here has already passed through Apple and Linq before this process sees it,
- * so encrypting a local copy would secure one link in a chain that already
- * leaked. And it would buy nothing, because the browser tier structurally
- * cannot use a password - detectBlock stops before a gated page and the decide
- * loop has no field that can hold one.
- *
- * So the credential never travels. Browserbase keeps a persistent context (a
- * cookie jar) per sender, and a session bound to that context exposes a live
- * view URL. The user opens that link, types the password into the real site in
- * that browser, and the cookies land in the context. This process only ever
- * holds a context id, which is an opaque handle. A session cookie can also be
- * revoked, where a reused password cannot.
- *
- * The live view URL is a bearer handle to a running browser, so it is sent
- * only to the verified sender, only on explicit request, and the session is
- * released as soon as the login is confirmed.
- */
-const senderContexts = new Map();
-
-/**
- * Whether this account can attach residential proxies to a browser session.
- *
- * The fetch API accepts them on every plan; sessions are a higher tier and
- * fail outright with "Failed to create a Browserbase session". Rather than
- * making that a setting somebody has to get right, the first attempt answers
- * it and the process remembers.
- */
-let proxySessions = BROWSER_PROXIES !== "false";
-
-async function launchSession(extra = {}) {
-  const base = {
-    apiKey: BROWSERBASE_API_KEY,
-    projectId: BROWSERBASE_PROJECT_ID,
-    ...extra,
-  };
-  if (proxySessions) {
-    try {
-      return await browserbase.launch({ ...base, proxies: true });
-    } catch (err) {
-      proxySessions = false;
-      console.warn(
-        `[browser] session proxies unavailable on this plan (${clamp(err.message, 60)}); ` +
-          "continuing without them - fetch still uses them",
-      );
-    }
-  }
-  return browserbase.launch(base);
-}
-
-const bb = new Browserbase({ apiKey: BROWSERBASE_API_KEY });
-
-async function ensureContext(sender) {
-  const existing = senderContexts.get(sender);
-  if (existing) return existing;
-  const created = await bb.contexts.create({ projectId: BROWSERBASE_PROJECT_ID });
-  senderContexts.set(sender, created.id);
-  console.log(`[login] created context for ${sender}`);
-  return created.id;
-}
-
-/**
- * A minimal Chrome DevTools Protocol client over the session's websocket.
- *
- * Stagehand cannot be used to park the login session. It drives pages through
- * an injected extension world, and on a fresh session that world is not ready
- * when the first navigation goes out:
- *
- *   Stagehand extension world not ready for frame ...; checked contexts: 1, 2
- *
- * That error was being caught and logged as "not fatal", so every handoff
- * silently handed over a blank tab and the user had to find the site
- * themselves. CDP talks to the browser directly and has nothing to warm up.
- * Node has had a global WebSocket since 22, so this needs no dependency.
- */
-function cdpConnect(wsUrl, { timeoutMs = 20000 } = {}) {
-  const ws = new WebSocket(wsUrl);
-  const pending = new Map();
-  let seq = 0;
-
-  ws.addEventListener("message", (event) => {
-    let msg;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-    const waiter = msg.id && pending.get(msg.id);
-    if (!waiter) return;
-    pending.delete(msg.id);
-    msg.error ? waiter.reject(new Error(msg.error.message)) : waiter.resolve(msg.result);
-  });
-
-  const ready = new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve, { once: true });
-    ws.addEventListener("error", () => reject(new Error("CDP socket failed")), { once: true });
-    setTimeout(() => reject(new Error("CDP connect timed out")), timeoutMs);
-  });
-
-  return {
-    ready,
-    close: () => ws.close(),
-    send(method, params = {}, sessionId) {
-      return new Promise((resolve, reject) => {
-        const id = ++seq;
-        pending.set(id, { resolve, reject });
-        ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-        setTimeout(() => {
-          if (!pending.delete(id)) return;
-          reject(new Error(`${method} timed out`));
-        }, timeoutMs);
-      });
-    },
-  };
-}
-
-/**
- * The live view is opened on a phone, so the browser behind it is phone-shaped.
- *
- * Browserbase defaults to a desktop window, which the DevTools live view then
- * scales down to fit a phone screen - a 1280px page on a 390px screen, where
- * every tap target is a third of its intended size. Matching the viewport to
- * the device means the page lays itself out for that width and the live view
- * renders it roughly 1:1.
- *
- * Deliberately NOT paired with Emulation.setDeviceMetricsOverride({mobile}) or
- * a phone user agent. Both were tried. Claiming to be iOS Safari over a Linux
- * TLS fingerprint got the navigation blocked outright (chrome-error://), and
- * mobile metrics alone made Instagram serve its app-install interstitial,
- * which has a "Log in" button and no form at all - measurably worse than the
- * desktop layout, which renders the real username and password fields.
- */
-const LOGIN_VIEWPORT = { width: 390, height: 844 };
-
-/**
- * How long the sign-in browser stays up, in seconds.
- *
- * The project default is 300. keepAlive stops the session ending when this
- * process disconnects, but it does not extend that timeout, so the browser was
- * dying after five minutes while the handoff message promised thirty and
- * pendingLogin kept waiting for a "done" that could no longer land. Signing in
- * on a phone - finding the password manager, switching apps, coming back -
- * routinely takes longer than five minutes, which is exactly the case this is
- * meant to serve.
- */
-const LOGIN_SESSION_SECONDS = 1800;
-
-async function startLoginSession(sender, url) {
-  const contextId = await ensureContext(sender);
-  const browser = await launchSession({
-    keepAlive: true,
-    timeout: LOGIN_SESSION_SECONDS,
-    browserSettings: {
-      context: { id: contextId, persist: true },
-      viewport: LOGIN_VIEWPORT,
-    },
-  });
-  // Deliberately not closing the handle: closing it ends the session, and the
-  // whole point is that it outlives this turn while the user signs in.
-
-  const sessionId = browser.sessionId;
-  let parked = false;
-  try {
-    const debug = await bb.sessions.debug(sessionId);
-    const cdp = cdpConnect(debug.wsUrl);
-    await cdp.ready;
-    try {
-      const { targetInfos } = await cdp.send("Target.getTargets");
-      const target = targetInfos.find((t) => t.type === "page");
-      if (!target) throw new Error("session has no page target");
-      // Navigate the tab that already exists rather than opening a second one,
-      // so the live view link and the signed-in page are the same tab.
-      const attached = await cdp.send("Target.attachToTarget", {
-        targetId: target.targetId,
-        flatten: true,
-      });
-      await cdp.send("Page.enable", {}, attached.sessionId);
-      await cdp.send("Page.navigate", { url }, attached.sessionId);
-      parked = true;
-      console.log(`[login] parked on ${url}`);
-    } finally {
-      cdp.close();
-    }
-  } catch (err) {
-    // Not fatal, but it is the difference between "sign in here" and "go find
-    // the site yourself", so the caller is told and says so.
-    console.warn(`[login] could not park on ${url}: ${err.message}`);
-  }
-
-  // Re-read after navigating: the page-level link targets the parked tab
-  // directly, where the session-level one depends on which tab is frontmost.
-  const live = await bb.sessions.debug(sessionId);
-  const page = live.pages?.[0];
-  return {
-    contextId,
-    sessionId,
-    parked,
-    liveUrl:
-      page?.debuggerFullscreenUrl ||
-      live.debuggerFullscreenUrl ||
-      page?.debuggerUrl ||
-      live.debuggerUrl,
-  };
-}
-
-/**
- * End the session so the context is written back.
- *
- * persist saves cookies when the session completes, so releasing it is what
- * actually banks the login - leaving it running would keep the cookies stranded
- * in a session nobody is using.
- */
-async function finishLoginSession(sessionId) {
-  try {
-    await bb.sessions.update(sessionId, {
-      projectId: BROWSERBASE_PROJECT_ID,
-      status: "REQUEST_RELEASE",
-    });
-  } catch (err) {
-    console.warn(`[login] release failed (${err.message}); context may still persist`);
-  }
-}
-
-const LOGIN_CONFIRM_RE = /\b(done|finished|ok(ay)?|logged? ?in|signed? ?in|ready|yes|yep|complete)\b/i;
-const LOGIN_REQUEST_RE = /\b(log ?in|login|sign ?in|authenticate|connect (my )?account)\b/i;
 
 /* ------------------------------------------------------------------ */
 /* Browser tier                                                        */
@@ -2646,7 +2417,7 @@ const DecisionSchema = z.object({
   stopReason: z.string().nullable(),
 });
 
-async function withSession(fn, { contextId = null } = {}) {
+async function withSession(fn) {
   return browserSlot(async () => {
     if (!BROWSERBASE_PROJECT_ID) {
       throw new Error("BROWSERBASE_PROJECT_ID is not set in .env");
@@ -2658,11 +2429,7 @@ async function withSession(fn, { contextId = null } = {}) {
       // for: Instagram serves a public profile to a phone and redirects a bare
       // datacenter IP to /accounts/login/. Proxies are attempted for that
       // reason and dropped silently if the plan does not allow them.
-      browser = await launchSession(
-        // A context the user has already signed in through, when there is one.
-        // persist keeps it current if this session picks up new cookies.
-        contextId ? { browserSettings: { context: { id: contextId, persist: true } } } : {},
-      );
+      browser = await launchSession();
       console.log(`[browser] session ${browser.sessionId}`);
       stagehand = await Stagehand.create({
         browser,
@@ -2695,7 +2462,7 @@ async function captureScreenshot(url, runId, n = 0) {
   });
 }
 
-async function runBrowserTier(classification, deadline, runId, { contextId = null } = {}) {
+async function runBrowserTier(classification, deadline, runId) {
   const playbook = PLAYBOOKS[classification.taskType];
   const objective = playbook.browserObjective(classification);
 
@@ -2816,7 +2583,7 @@ ${history.length ? history.map((h, i) => `${i + 1}. ${h.description} -> ${h.outc
 
     const data = await extractWithFallback(stagehand, page, playbook, classification, history);
     return { data, tier: "browser", screenshots, history, corpus: null };
-  }, { contextId });
+  });
 }
 
 async function screenshotInto(page, runId, n) {
@@ -3410,6 +3177,21 @@ function matchWatch(list, phrase) {
   return scored[0].w;
 }
 
+/**
+ * Drop watches that finished long enough ago to be forgotten.
+ *
+ * Runs on the existing sweep rather than on a timer of its own - it is garbage
+ * collection, and it belongs with the other garbage collection.
+ */
+function sweepFinishedWatches() {
+  try {
+    const n = watches.purgeFinished(Number(WATCH_RETAIN_MS));
+    if (n) console.log(`[watch] purged ${n} finished watch${n === 1 ? "" : "es"}`);
+  } catch (err) {
+    console.warn(`[watch] purge failed: ${err.message}`);
+  }
+}
+
 let watchTickRunning = false;
 async function runWatchTick({ send = sendLinq } = {}) {
   if (watchTickRunning) return { skipped: true };
@@ -3439,7 +3221,7 @@ async function runWatchTick({ send = sendLinq } = {}) {
  * Degradation ladder. The invariant is that the user always gets links:
  * browser -> research -> raw search results.
  */
-async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT), { conversation = null, onClassified = null, contextId = null } = {}) {
+async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT), { conversation = null, onClassified = null } = {}) {
   const notes = [];
 
   let classification;
@@ -3469,7 +3251,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
   let result;
   if (classification.tier === "browser") {
     try {
-      result = await runBrowserTier(classification, deadline, runId, { contextId });
+      result = await runBrowserTier(classification, deadline, runId);
       if (result.authWall) {
         // Policy: fall back to public sources rather than attempting a login.
         const blockedHost = hostOf(classification.targetUrl ?? result.authWall.url);
@@ -3492,7 +3274,7 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
     } catch (err) {
       if (classification.targetUrl && deadline.remaining() > 60000) {
         console.warn(`[research] thin (${err.message}), escalating to browser`);
-        result = await runBrowserTier(classification, deadline, runId, { contextId });
+        result = await runBrowserTier(classification, deadline, runId);
       } else {
         throw err;
       }
@@ -3602,14 +3384,14 @@ async function fallbackLinks(messageText) {
   }
 }
 
-async function handleRequest(senderNumber, messageText, { conversation = null, send = sendLinq, onClassified = null, contextId = null } = {}) {
+async function handleRequest(senderNumber, messageText, { conversation = null, send = sendLinq, onClassified = null } = {}) {
   const runId = crypto.randomUUID();
   const deadline = new Deadline(TASK_TIMEOUT);
   const started = Date.now();
   const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`;
 
   try {
-    const result = await runTask(messageText, runId, deadline, { conversation, onClassified, contextId });
+    const result = await runTask(messageText, runId, deadline, { conversation, onClassified });
 
     const parts = [{ type: "text", value: result.text }];
     if (result.screenshots.length) {
@@ -3707,68 +3489,6 @@ async function handleTurn(senderNumber, messageText, { send = sendLinq, routeOnl
   // deterministic checks rather than another model call: "done" after being
   // sent a sign-in link is not an ambiguous sentence, and a model that
   // mis-routes it would strand the user mid-flow.
-  const login = mem.pendingLogin && Date.now() - mem.pendingLogin.at < 1800000
-    ? mem.pendingLogin
-    : null;
-
-  if (login?.stage === "offered" && LOGIN_REQUEST_RE.test(safeText)) {
-    let handoff;
-    try {
-      handoff = await startLoginSession(senderNumber, login.url);
-    } catch (err) {
-      console.warn(`[login] could not start a session: ${err.message}`);
-      mem.pendingLogin = null;
-      const note = `I couldn't open a sign-in browser just now (${clamp(err.message, 60)}). Try again in a moment.`;
-      recordTurn(senderNumber, "assistant", note, "error");
-      await send(senderNumber, [{ type: "text", value: note }]);
-      return;
-    }
-    mem.pendingLogin = { ...login, ...handoff, stage: "waiting", at: Date.now() };
-    const note =
-      (handoff.parked
-        ? `Open this - it's a browser running on my side, already on the ${login.host} sign-in page. `
-        : `Open this and go to ${login.host} - it's a browser running on my side. `) +
-      `Your password goes straight to ${login.host} and never through me:
-
-${handoff.liveUrl}
-
-` +
-      // The live view is a screencast of a remote screen, so a phone keyboard
-      // does not always open when you tap a field - there is no real input on
-      // your device to focus. Better to say so than let them fight it: the
-      // session stays up for 30 minutes and the link works from any device.
-      `If your keyboard won't come up when you tap a field, open the same link on a ` +
-      `laptop - it's a remote screen, so phones don't always offer the keyboard. ` +
-      `You've got 30 minutes.
-
-Text me "done" when you're in and I'll pick the task back up. ` +
-      `Don't share that link - anyone with it can drive that browser.`;
-    // The live view URL is deliberately not stored in history: it is a bearer
-    // handle to a running browser, and history goes into later prompts.
-    recordTurn(senderNumber, "assistant", `(sent a sign-in link for ${login.host})`, "task");
-    await send(senderNumber, [{ type: "text", value: note }]);
-    return;
-  }
-
-  if (login?.stage === "waiting" && LOGIN_CONFIRM_RE.test(safeText)) {
-    await finishLoginSession(login.sessionId);
-    mem.pendingLogin = null;
-    console.log(`[login] resuming "${clamp(login.request, 60)}" with a signed-in context`);
-    if (shouldAck("product_research", "browser")) {
-      await send(senderNumber, [{ type: "text", value: "Thanks - picking that back up now." }]);
-    }
-    const resumed = await handleRequest(senderNumber, login.request, {
-      conversation: mem,
-      send,
-      contextId: login.contextId,
-    });
-    if (resumed) {
-      recordTaskResult(senderNumber, resumed);
-      recordTurn(senderNumber, "assistant", resumed.text, "task");
-    }
-    return;
-  }
-
   let route;
   try {
     route = await routeTurn({
@@ -3870,7 +3590,6 @@ Text me "done" when you're in and I'll pick the task back up. ` +
     onClassified,
     // Reuse a context this sender has already signed in through, so a site
     // they authenticated once does not ask again.
-    contextId: senderContexts.get(senderNumber) ?? null,
   });
 
   if (!result) {
@@ -3881,23 +3600,13 @@ Text me "done" when you're in and I'll pick the task back up. ` +
   recordTaskResult(senderNumber, result);
   recordTurn(senderNumber, "assistant", result.text, "task");
 
-  // Something turned us away at a login. Offer the handover rather than
-  // starting a browser speculatively: standing one up costs a session, and the
-  // user may be perfectly happy with the public answer they just got.
-  if (result.blockedHost && !senderContexts.has(senderNumber)) {
-    mem.pendingLogin = {
-      stage: "offered",
-      host: result.blockedHost,
-      url: `https://${result.blockedHost}`,
-      request,
-      at: Date.now(),
-    };
-    const offer =
-      `That one's behind a login on ${result.blockedHost}. Reply "login" and I'll send ` +
-      `you a link to sign in yourself - the password goes straight to ${result.blockedHost}, ` +
-      `never through me - and after that I can keep using the session.`;
-    recordTurn(senderNumber, "assistant", offer, "task");
-    await send(senderNumber, [{ type: "text", value: offer }]);
+  // Something turned us away at a login. Say so plainly - there is no sign-in
+  // handover to offer any more, and a watchdog for public pages does not need
+  // one. Silence here would look like a thin answer with no explanation.
+  if (result.blockedHost) {
+    const note = `${result.blockedHost} needs an account, so that's from public sources only.`;
+    recordTurn(senderNumber, "assistant", note, "task");
+    await send(senderNumber, [{ type: "text", value: note }]);
   }
 }
 
@@ -4046,13 +3755,6 @@ app.post("/debug/turn", async (req, res) => {
         pendingClarify: mem.pendingClarify,
         // liveUrl omitted on purpose: it is a bearer handle to a running
         // browser, and this response is easy to paste somewhere.
-        pendingLogin: mem.pendingLogin && {
-          stage: mem.pendingLogin.stage,
-          host: mem.pendingLogin.host,
-          request: mem.pendingLogin.request,
-          hasLiveUrl: Boolean(mem.pendingLogin.liveUrl),
-          sessionId: mem.pendingLogin.sessionId ?? null,
-        },
       },
     });
   } catch (err) {
@@ -4060,49 +3762,6 @@ app.post("/debug/turn", async (req, res) => {
   }
 });
 
-/**
- * Start a real login handoff, report what the user would be handed, release it.
- *
- * This exists because the parking failure was invisible: it was caught, logged
- * as "not fatal", and every handoff quietly delivered a blank tab. Checking it
- * needs a real session, so this drives the shipping startLoginSession rather
- * than a copy of it, and always releases what it started.
- *
- * Costs one Browserbase session per call, so it is not in the fast suite.
- */
-app.post("/debug/login", async (req, res) => {
-  if (!DEBUG_TOKEN || req.get("x-debug-token") !== DEBUG_TOKEN) {
-    return res.status(404).json({ error: "not found" });
-  }
-  const from = String(req.body?.from ?? "+15550000000");
-  const url = String(req.body?.url ?? "https://www.instagram.com/accounts/login/");
-  const started = Date.now();
-  let handoff;
-  try {
-    handoff = await startLoginSession(from, url);
-    const live = await bb.sessions.debug(handoff.sessionId);
-    const meta = await bb.sessions.retrieve(handoff.sessionId);
-    res.json({
-      elapsedMs: Date.now() - started,
-      parked: handoff.parked,
-      landedOn: live.pages?.[0]?.url ?? null,
-      // The message promises the user a window to sign in; this is the number
-      // that has to back it up.
-      lifetimeMin: Math.round(
-        (new Date(meta.expiresAt) - new Date(meta.startedAt)) / 60000,
-      ),
-      // The live URL itself is withheld on purpose: it is a bearer handle to a
-      // running browser and this response is easy to paste somewhere.
-      liveUrlKind: handoff.liveUrl?.includes("/devtools-fullscreen/") ? "fullscreen" : "other",
-      viewport: LOGIN_VIEWPORT,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  } finally {
-    if (handoff?.sessionId) await finishLoginSession(handoff.sessionId);
-    senderContexts.delete(from);
-  }
-});
 
 /** The stored conversation for one sender, already redacted on the way in. */
 app.get("/debug/memory", (req, res) => {
@@ -4180,6 +3839,7 @@ await fs.mkdir(ARTIFACT_DIR, { recursive: true });
 setInterval(() => {
   sweepArtifacts();
   sweepSenders();
+  sweepFinishedWatches();
 }, 600000).unref();
 sweepArtifacts();
 

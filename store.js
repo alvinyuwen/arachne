@@ -179,6 +179,27 @@ export function openStore(file) {
     listAllForSender: (sender) => stmt.allBySender.all(sender).map(hydrate),
     due: (now = Date.now(), limit = 25) => stmt.due.all(now, limit).map(hydrate),
     countActive: (sender) => stmt.countActive.get(sender)?.n ?? 0,
+
+    /**
+     * Delete watches that are finished and have been for a while.
+     *
+     * A retired watch is not worth keeping forever - it can never fire again,
+     * and left alone the table only grows. But deleting the moment one ends is
+     * wrong too: "keep watching" after an ask-renewal needs the row, and "stop
+     * watching the keyboard" followed by "actually, resume it" is a normal
+     * thing to say. So they are retired first and purged after a grace period.
+     *
+     * awaiting_renewal is deliberately not swept: it is waiting on a person,
+     * not finished, and answering "yes" an hour later must still work.
+     */
+    purgeFinished: (olderThanMs, now = Date.now()) =>
+      db
+        .prepare(
+          `DELETE FROM watches
+           WHERE status IN ('fired', 'cancelled', 'failed') AND updated_at < ?`,
+        )
+        .run(now - olderThanMs).changes ?? 0,
+
     close: () => db.close(),
   };
 }

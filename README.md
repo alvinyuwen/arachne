@@ -88,6 +88,11 @@ than "already over". Stock metrics get a market-hours window automatically.
 scheduled update regardless of change). Renewal is `none`, `auto` (re-baseline)
 or `ask` (text you first).
 
+A finished watch is deleted after `WATCH_RETAIN_MS` — retired first, purged
+later. Not immediately: "keep watching" after a renewal prompt, and "actually,
+resume that one", both need the row to still exist. One `awaiting_renewal` is
+never purged at all, because it is waiting on a person rather than finished.
+
 ### The model extracts, code decides
 
 The model returns a typed observation. A pure function in `watch.js` compares it
@@ -155,6 +160,7 @@ npm install
 | `WATCH_MAX_PER_SENDER` | Active watches per person (default 10) |
 | `WATCH_NOTIFY_COOLDOWN_MS` | Floor between two alerts for one watch (default 30m) |
 | `WATCH_MAX_FAILS` | Consecutive failures before a watch pauses itself (default 5) |
+| `WATCH_RETAIN_MS` | How long a finished watch is kept before deletion (default 24h) |
 
 ## Run
 
@@ -184,9 +190,10 @@ range is dropped.
 
 **The agent cannot log in.** `detectBlock()` runs before every decision and
 before any action — deterministic regexes over URL, title and accessibility
-tree, no LLM to talk around. On a wall it screenshots the wall, stops, and falls
-back to public sources. The decide-loop schema has no field capable of
-expressing a credential, so no code path can type one.
+tree, no LLM to talk around. On a wall it says so, stops, and falls back to
+public sources. The decide-loop schema has no field capable of expressing a
+credential, so no code path can type one, and there is no sign-in path at all —
+a watchdog for public pages does not need one.
 
 **No blind step lists.** The browser tier observes the live page, picks an index
 into the observed actions, and feeds prior step outcomes back in — so it cannot
@@ -254,8 +261,9 @@ curl -X POST localhost:3000/debug/watch -H "x-debug-token: $DEBUG_TOKEN"   -H "C
 
 ```bash
 node tests/test_webhook_parse.mjs # 16, no server, no network
+node tests/test_repeat.mjs        # 19, no server, no network
 node tests/test_watch_eval.mjs    # 69, no server, no network - the important one
-node tests/test_watch_store.mjs   # 27, no server; includes restart durability
+node tests/test_watch_store.mjs   # 33, no server; includes restart durability
 node tests/test_redaction.mjs     # 28, no server
 node tests/test_routing.mjs       # 35, server running
 ```

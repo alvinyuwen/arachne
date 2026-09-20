@@ -123,6 +123,44 @@ console.log("\nper-sender views\n");
 }
 
 /* ---------------------------------------------------------------- */
+console.log("\npurging finished watches - what it must NOT delete matters most\n");
+
+{
+  const fresh = openStore(dbFile);
+  const mk = (label, status) => fresh.create(sample({ label, status }));
+
+  const done = mk("finished and old", "fired");
+  const stopped = mk("cancelled and old", "cancelled");
+  const live = mk("still active", "active");
+  const waiting = mk("waiting on the user", "awaiting_renewal");
+
+  // Age the two terminal ones past the retention window.
+  const old = Date.now() - 2 * DAY;
+  for (const id of [done.id, stopped.id]) {
+    fresh.db.prepare("UPDATE watches SET updated_at = ? WHERE id = ?").run(old, id);
+  }
+
+  const removed = fresh.purgeFinished(DAY);
+  check("finished and cancelled watches are purged", removed === 2, `removed ${removed}`);
+  check("a fired watch is gone", fresh.get(done.id) === null);
+  check("a cancelled watch is gone", fresh.get(stopped.id) === null);
+
+  // The two that must survive, and why.
+  check("an ACTIVE watch is never purged", fresh.get(live.id) != null);
+  check("one awaiting a renewal answer is never purged - it is waiting on a person, not finished",
+    fresh.get(waiting.id) != null);
+
+  // Retired just now: "actually, resume that" is a normal thing to say, so the
+  // row has to outlive the moment it ended.
+  const justEnded = mk("finished a moment ago", "fired");
+  check("a watch that just finished is kept for the grace period",
+    fresh.purgeFinished(DAY) === 0 && fresh.get(justEnded.id) != null);
+
+  for (const w of [live, waiting, justEnded]) fresh.remove(w.id);
+  fresh.close();
+}
+
+/* ---------------------------------------------------------------- */
 console.log("\nrestart durability - the reason this is on disk at all\n");
 
 {
