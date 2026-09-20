@@ -171,6 +171,7 @@ Point the Linq `message.received` webhook at `https://<host>/webhook/linq`.
 | --- | --- |
 | `product_research` | Search review roundups, retailer listings **and forum opinion**, compare, then do a targeted retail lookup per pick for live price, stock and a regional buy link |
 | `factual_lookup` | Search, read, answer with cited key facts |
+| `analysis` | Read across sources and give a considered answer: consensus, where sources disagree, its own view, and implications — each claim tied to a real source |
 | `social_media` | Public pages only. Never logs in |
 | `interactive_browse` | Drives a real browser, one observed step at a time |
 

@@ -1310,7 +1310,7 @@ async function runChat({ text, mem, deadline }) {
 
 const ClassificationSchema = z.object({
   taskType: z
-    .enum(["product_research", "factual_lookup", "social_media", "interactive_browse"])
+    .enum(["product_research", "factual_lookup", "analysis", "social_media", "interactive_browse"])
     .describe("Which playbook handles this request"),
   tier: z.enum(["research", "browser"]).describe("research = read public pages; browser = interact with a live page"),
   restatedGoal: z.string().describe("One sentence restating what the user wants"),
@@ -1346,9 +1346,18 @@ TIER RULES
 TASK TYPES
 - product_research: recommending or comparing things to buy.
   e.g. "best noise cancelling headphones under $300" / "which laptop should I get for video editing"
-- factual_lookup: a question with an answer.
+- factual_lookup: a question with a short answer.
   e.g. "what time does the Louvre open" / "who won the F1 race yesterday"
-- social_media: anything about a person's or brand's presence on a social platform.
+- analysis: they want it read, weighed and interpreted, not just looked up. Any request for
+  a summary of what people think, a consensus, a comparison of views, an opinion, or your
+  own take. "analyse", "what's the reaction", "what do people think", "summarise the
+  discussion", "what does this mean for X", "add your own analysis" all land here.
+  e.g. "analyse the reaction to yesterday's game and what it means for the league" /
+       "what are people saying about the new iPhone"
+  Pick this over factual_lookup whenever the answer is longer than a couple of sentences,
+  and over social_media whenever the subject is a TOPIC rather than an account.
+- social_media: what a specific PERSON or BRAND has publicly posted or shown. About an
+  account, not about a subject being discussed.
   e.g. "what has @nasa posted lately" / "find the official Patagonia Instagram"
 - interactive_browse: operating a specific page.
   e.g. "fill out the contact form at example.com" / "check if my order shipped at <url>"
@@ -1424,6 +1433,7 @@ LATEST REQUEST: ${messageText}`
   return c;
 }
 
+
 /* ------------------------------------------------------------------ */
 /* Playbooks                                                           */
 /* ------------------------------------------------------------------ */
@@ -1464,6 +1474,51 @@ const FactualSchema = z.object({
   ),
   confidence: z.enum(["high", "medium", "low"]),
   caveats: z.array(z.string()),
+});
+
+/**
+ * "Read these and tell me what you think."
+ *
+ * The playbook that was missing. A request to analyse a topic across sources -
+ * consensus, disagreement, what it means - had nowhere to land: it fell to
+ * social_media, whose schema is {subject, publicFindings[{platform, handle,
+ * detail}]} and has no field capable of holding an argument. Someone asked for
+ * the consensus of post-match threads plus a view on the league, and got a list
+ * of "what's public" about Reddit as an entity, because that is the only shape
+ * the schema could express.
+ *
+ * ownView is deliberately its own field rather than mixed into the summary.
+ * The user asked for analysis *in addition to* what sources said, and keeping
+ * the two apart is also the only way a reader can tell which is which.
+ */
+const AnalysisSchema = z.object({
+  headline: z.string().describe("What happened or what the answer is, one sentence"),
+  consensus: z
+    .array(
+      z.object({
+        point: z.string().describe("A view that recurs across sources, stated concretely"),
+        sourceIndex: z.number().int(),
+      }),
+    )
+    .describe("The points most sources agree on. 2-4 of them."),
+  disagreement: z
+    .array(
+      z.object({
+        point: z.string().describe("Where sources differ, and how"),
+        sourceIndex: z.number().int(),
+      }),
+    )
+    .describe("Where the sources do NOT agree. Empty if they broadly do."),
+  ownView: z
+    .string()
+    .describe(
+      "Your own analysis, going beyond what the sources say. This is asked for explicitly - " +
+        "reason about causes and consequences rather than restating the summary.",
+    ),
+  implications: z
+    .string()
+    .describe("What this means going forward. Empty string if the request did not ask."),
+  caveats: z.array(z.string()).describe("What the sources could not establish"),
 });
 
 const SocialSchema = z.object({
@@ -1553,6 +1608,54 @@ ${SOURCE_RULES}`,
     },
   },
 
+  analysis: {
+    schema: AnalysisSchema,
+    synthesisSystem: () =>
+      `You read the numbered sources and give a considered answer.\n\n` +
+      `Report what the sources actually say in consensus and disagreement, each tied to the ` +
+      `source it came from. Then give your own view in ownView - that is asked for, and it ` +
+      `is the part a search engine cannot do. Say something substantive: what caused this, ` +
+      `what follows from it, what would change your mind.\n\n` +
+      `If the sources do not cover what was asked, say so in caveats rather than padding ` +
+      `consensus with things you inferred.\n${SOURCE_RULES}`,
+    browserObjective: (c) => c.restatedGoal,
+    extractHint: "",
+    render: (data, c, corpus) => {
+      const lines = [stripMarkdownSoft(data.headline), ""];
+      const link = (i) => corpus?.[i]?.url;
+
+      if (data.consensus?.length) {
+        lines.push("What people are saying:");
+        for (const p of data.consensus.slice(0, 4)) {
+          lines.push(`· ${clamp(stripMarkdown(p.point), 180)}`);
+        }
+        lines.push("");
+      }
+      if (data.disagreement?.length) {
+        lines.push("Where they differ:");
+        for (const p of data.disagreement.slice(0, 2)) {
+          lines.push(`· ${clamp(stripMarkdown(p.point), 180)}`);
+        }
+        lines.push("");
+      }
+      if (data.ownView) {
+        // Labelled, because the user asked for analysis in addition to the
+        // reporting and should be able to tell which part is which.
+        lines.push("My read:", clamp(stripMarkdownSoft(data.ownView), 700), "");
+      }
+      if (data.implications) {
+        lines.push("What it means:", clamp(stripMarkdownSoft(data.implications), 500), "");
+      }
+
+      const urls = uniq(
+        [...(data.consensus ?? []), ...(data.disagreement ?? [])].map((p) => link(p.sourceIndex)).filter(Boolean),
+      ).slice(0, 3);
+      if (urls.length) lines.push("Sources:", ...urls);
+      if (data.caveats?.length) lines.push("", clamp(stripMarkdown(data.caveats[0]), 160));
+      return lines.join("\n").trim();
+    },
+  },
+
   social_media: {
     schema: SocialSchema,
     synthesisSystem: () => `You report on public social media presence.\n${AUTH_POLICY}\n${SOURCE_RULES}`,
@@ -1618,7 +1721,7 @@ const BLOCK_URL_RE = /\/(login|signin|sign-in|auth|accounts|checkpoint|challenge
 const BLOCK_HOST_RE = /^(accounts\.|login\.|signin\.|auth\.)/i;
 const BLOCK_TITLE_RE = /log ?in|sign ?in|verify|captcha|are you (a )?human|access denied/i;
 const BLOCK_BODY_RE =
-  /type=["']password|sign in to continue|log in to continue|create an account to|subscribe to read|verify you are human|enable javascript and cookies|unusual traffic/i;
+  /type=["']password|sign in to continue|log in to continue|create an account to|subscribe to read|verify you are human|enable javascript and cookies|unusual traffic|blocked by network security|you have been blocked|access to this page has been denied/i;
 
 function blockFromText({ url = "", title = "", body = "" }) {
   let host = "";
@@ -1698,18 +1801,30 @@ async function searchAll(queries, deadline) {
 
 /** Cheap regex de-boilerplating - no LLM, no dependency. */
 function stripBoilerplate(text) {
-  return text
-    .split("\n")
-    .filter((line) => {
-      const t = line.trim();
-      if (!t) return true;
-      if (/^[[|]/.test(t)) return false; // nav link lists
-      if (/^(skip to|cookie|accept all|subscribe|sign up for our)/i.test(t)) return false;
-      return true;
-    })
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return (
+    text
+      // Inline images arrive as base64 and can be most of the document: a
+      // Reddit page measured 87k characters, the readable part a fraction of
+      // it. Every one of those is corpus budget spent on nothing, and since
+      // each source is capped at 9000 characters they crowd out the page
+      // itself - the model then reports that it could not find the content.
+      // No \s in the class: base64 in markdown is one unbroken run, and
+      // allowing whitespace let this swallow the prose that followed the blob.
+      .replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]+/gi, " ")
+      // Long unbroken base64-ish runs left behind by the same thing.
+      .replace(/[A-Za-z0-9+/]{200,}={0,2}/g, " ")
+      .split("\n")
+      .filter((line) => {
+        const t = line.trim();
+        if (!t) return true;
+        if (/^[[|]/.test(t)) return false; // nav link lists
+        if (/^(skip to|cookie|accept all|subscribe|sign up for our)/i.test(t)) return false;
+        return true;
+      })
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
 }
 
 async function buildCorpus(results, deadline, minSources = 2) {
@@ -1746,17 +1861,31 @@ async function buildCorpus(results, deadline, minSources = 2) {
     const floor = r.direct ? 120 : 800;
     if (text.length < floor) throw new Error(`thin body (${text.length} chars)`);
     const block = blockFromText({ url: r.url, body: text });
-    if (block.blocked) throw new Error(`blocked: ${block.kind}`);
+    // The host is carried on the error so the caller can say WHICH site refused
+    // rather than dropping it silently. Reddit serves 87k characters of which
+    // 236 are "You've been blocked by network security" - without this the user
+    // asks about Reddit threads, gets an answer from elsewhere, and is never
+    // told the one source they named was unreachable.
+    if (block.blocked) {
+      const err = new Error(`blocked: ${block.kind}`);
+      err.blockedHost = r.host ?? hostOf(r.url);
+      throw err;
+    }
 
     return { ...r, text: text.slice(0, 9000) };
   };
 
   const settled = await mapLimit(results, Number(RESEARCH_FETCH_CONCURRENCY), fetchOne);
   const corpus = [];
+  const blockedHosts = [];
   for (const r of settled) {
     if (r.ok) corpus.push({ ...r.value, index: corpus.length });
-    else console.warn(`[fetch] skipped: ${r.error.message}`);
+    else {
+      console.warn(`[fetch] skipped: ${r.error.message}`);
+      if (r.error.blockedHost) blockedHosts.push(r.error.blockedHost);
+    }
   }
+  corpus.blockedHosts = uniq(blockedHosts);
   console.log(`[corpus] ${corpus.length}/${results.length} sources usable`);
   if (corpus.length < minSources) {
     throw new ResearchThinError(`only ${corpus.length} usable source(s), need ${minSources}`);
@@ -2262,6 +2391,12 @@ function validateSourceIndexes(data, corpus, classification) {
   if (Array.isArray(data.keyFacts)) data.keyFacts = data.keyFacts.filter((f) => inRange(f.sourceIndex));
   if (Array.isArray(data.publicFindings)) {
     data.publicFindings = data.publicFindings.filter((f) => inRange(f.sourceIndex));
+  }
+  // The analysis playbook cites from two arrays. Same rule as everywhere else:
+  // a citation that does not point at a real fetched source is dropped rather
+  // than rendered, so a link can never be invented.
+  for (const key of ["consensus", "disagreement"]) {
+    if (Array.isArray(data[key])) data[key] = data[key].filter((p) => inRange(p.sourceIndex));
   }
   return data;
 }
@@ -3380,6 +3515,19 @@ async function runTask(messageText, runId, deadline = new Deadline(TASK_TIMEOUT)
 
   const playbook = PLAYBOOKS[classification.taskType];
   let text = playbook.render(result.data, classification, result.corpus);
+
+  // Name a site that refused us, but only one the user actually asked about.
+  // "Couldn't read cdn.example.com" is noise; "couldn't read reddit.com" when
+  // they asked for Reddit threads is the difference between a thin answer and
+  // an unexplained one.
+  const refused = (result.corpus?.blockedHosts ?? []).filter((h) => {
+    const name = String(h).replace(/^(www|old|m)\./i, "").split(".")[0];
+    return name.length > 3 && new RegExp(`\\b${name}\\b`, "i").test(messageText);
+  });
+  if (refused.length) {
+    notes.push(`Couldn't read ${refused[0]} - it blocks automated access, so this is from other sources.`);
+  }
+
   if (notes.length) text = `${notes.join("\n")}\n\n${text}`;
 
   // One screenshot of the top pick, per the chosen reply format.
